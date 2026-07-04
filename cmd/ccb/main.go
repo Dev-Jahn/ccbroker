@@ -142,7 +142,7 @@ func syncCycle(cfg *config.Agent, client *http.Client, forceAuto bool) int {
 		}
 		writeStatusCache(cfg, rows)
 	}
-	return syncAll(cfg, client)
+	return syncAll(cfg, client, rows)
 }
 
 // autoSelect keeps the current active account while it is alive and under
@@ -188,8 +188,15 @@ func autoSelect(cfg *config.Agent, rows []usageRow) error {
 	return nil
 }
 
-// syncAll syncs every target and returns the number of failures.
-func syncAll(cfg *config.Agent, client *http.Client) int {
+// syncAll syncs every target and returns the number of failures. rows carries
+// the broker's per-cred oauthAccount so the credential's identity (which Claude
+// Code shows in /status) follows the account, keeping /status and the token in
+// agreement after a switch.
+func syncAll(cfg *config.Agent, client *http.Client, rows []usageRow) int {
+	byName := make(map[string]usageRow, len(rows))
+	for _, r := range rows {
+		byName[r.Name] = r
+	}
 	fails := 0
 	for _, t := range cfg.Targets {
 		name, err := resolveCred(cfg, t.Cred)
@@ -210,8 +217,79 @@ func syncAll(cfg *config.Agent, client *http.Client) int {
 			continue
 		}
 		logf("cred=%s target=%s -> %s OK", name, t.Type, t.Path)
+		if row, ok := byName[name]; ok && row.OAuthAccount != nil {
+			if cj := claudeJSONForTarget(t); cj != "" {
+				switch changed, err := syncIdentity(cj, row.OAuthAccount); {
+				case err != nil:
+					logf("cred=%s identity WARN %v", name, err)
+				case changed:
+					logf("cred=%s identity -> %s updated", name, cj)
+				}
+			}
+		}
 	}
 	return fails
+}
+
+// claudeJSONForTarget returns the .claude.json Claude Code actually reads for a
+// target, or "" if not applicable. Layout quirk: the DEFAULT config dir
+// (~/.claude, i.e. CLAUDE_CONFIG_DIR unset) keeps its .claude.json at HOME
+// (~/.claude.json), while a custom CLAUDE_CONFIG_DIR colocates it as a sibling
+// of the credential file. The keychain target is macOS's default dir → HOME.
+func claudeJSONForTarget(t config.Target) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	defaultJSON := filepath.Join(home, ".claude.json")
+	switch t.Type {
+	case "file":
+		p := expandHome(t.Path)
+		if p == "" {
+			return ""
+		}
+		dir := filepath.Dir(p)
+		if dir == filepath.Join(home, ".claude") {
+			return defaultJSON
+		}
+		return filepath.Join(dir, ".claude.json")
+	case "keychain":
+		return defaultJSON
+	}
+	return ""
+}
+
+// syncIdentity rewrites .claude.json's "oauthAccount" to match acct when the
+// recorded email differs (a no-op otherwise), so /status reflects the account
+// whose token is currently in place. All other keys are preserved.
+func syncIdentity(path string, acct map[string]any) (bool, error) {
+	email, _ := acct["emailAddress"].(string)
+	m := map[string]any{}
+	if b, err := os.ReadFile(path); err == nil {
+		// UseNumber so large integers (timestamps, counters) round-trip exactly
+		// instead of degrading to float64 when this big file is rewritten.
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.UseNumber()
+		if err := dec.Decode(&m); err != nil {
+			return false, fmt.Errorf("%s not valid JSON: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	if cur, ok := m["oauthAccount"].(map[string]any); ok {
+		if e, _ := cur["emailAddress"].(string); e == email {
+			return false, nil // already this account
+		}
+	}
+	if _, ok := m["hasCompletedOnboarding"]; !ok {
+		m["hasCompletedOnboarding"] = true
+	}
+	m["oauthAccount"] = acct
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	return true, writeFile(path, append(b, '\n'))
 }
 
 // resolveCred maps the special name "@active" to the account named in the
@@ -257,6 +335,7 @@ type usageRow struct {
 	Dead           bool             `json:"dead,omitempty"`
 	ExpiresAt      int64            `json:"expiresAt"`
 	Usage          *anthropic.Usage `json:"usage,omitempty"`
+	OAuthAccount   map[string]any   `json:"oauthAccount,omitempty"`
 	UsageFetchedAt int64            `json:"usageFetchedAt,omitempty"`
 	UsageError     string           `json:"usageError,omitempty"`
 }

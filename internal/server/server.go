@@ -41,9 +41,10 @@ type Server struct {
 }
 
 type usageEntry struct {
-	Usage     *anthropic.Usage
-	FetchedAt int64 // unix ms
-	LastError string
+	Usage        *anthropic.Usage
+	OAuthAccount map[string]any // Claude Code .claude.json "oauthAccount" shape
+	FetchedAt    int64          // unix ms
+	LastError    string
 }
 
 // New constructs a Server and opens the audit log.
@@ -230,6 +231,7 @@ func (s *Server) pollUsage(ctx context.Context) {
 		}
 		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		u, err := anthropic.FetchUsage(cctx, rec.AccessToken())
+		acct, perr := anthropic.FetchProfile(cctx, rec.AccessToken(), time.Now().UnixMilli())
 		cancel()
 		s.usageMu.Lock()
 		e := s.usage[rec.Name]
@@ -244,9 +246,15 @@ func (s *Server) pollUsage(ctx context.Context) {
 			e.FetchedAt = time.Now().UnixMilli()
 			e.LastError = ""
 		}
+		if perr == nil {
+			e.OAuthAccount = acct
+		}
 		s.usageMu.Unlock()
 		if err != nil {
 			s.audit.Printf("USAGE name=%s result=ERR err=%v", rec.Name, err)
+		}
+		if perr != nil {
+			s.audit.Printf("PROFILE name=%s result=ERR err=%v", rec.Name, perr)
 		}
 	}
 }
@@ -350,6 +358,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		Dead           bool             `json:"dead,omitempty"`
 		ExpiresAt      int64            `json:"expiresAt"`
 		Usage          *anthropic.Usage `json:"usage,omitempty"`
+		OAuthAccount   map[string]any   `json:"oauthAccount,omitempty"`
 		UsageFetchedAt int64            `json:"usageFetchedAt,omitempty"`
 		UsageError     string           `json:"usageError,omitempty"`
 	}
@@ -362,6 +371,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		s.usageMu.Lock()
 		if e := s.usage[rec.Name]; e != nil {
 			rw.Usage = e.Usage
+			rw.OAuthAccount = e.OAuthAccount
 			rw.UsageFetchedAt = e.FetchedAt
 			rw.UsageError = e.LastError
 		}

@@ -1,0 +1,21 @@
+{
+  "listen": ":8787",
+  "adminListen": "127.0.0.1:8788",
+  "adminToken": "REPLACE_WITH_RANDOM_ADMIN_TOKEN",
+  "storePath": "/var/lib/ccbroker/store.enc",
+  "keyPath": "/etc/ccbroker/master.key",
+  "auditLog": "/var/log/ccbroker/audit.log",
+  "refreshSkewSec": 600,
+  "clients": [
+    {
+      "name": "my-laptop",
+      "tokenSha256": "REPLACE_WITH_SHA256_OF_THE_CLIENT_TOKEN",
+      "scopes": ["*"]
+    },
+    {
+      "name": "gpu-box",
+      "tokenSha256": "REPLACE_WITH_SHA256_OF_ANOTHER_CLIENT_TOKEN",
+      "scopes": ["work"]
+    }
+  ]
+}

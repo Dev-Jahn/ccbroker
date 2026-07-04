@@ -1,0 +1,17 @@
+# secrets & runtime state — never commit
+*.key
+*.pem
+store.enc
+config.json
+agent.json
+seed*.json
+*.credentials.json
+.credentials.json
+
+# build artifacts
+/dist/
+*.tgz
+/ccbrokerd
+/ccbroker-agent
+ccbroker-agent.darwin-*
+ccbroker-agent.linux-*

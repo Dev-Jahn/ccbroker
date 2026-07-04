@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude credential broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ccbrokerd serve -c /etc/ccbroker/config.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ccbroker /var/log/ccbroker
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

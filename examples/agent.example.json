@@ -1,0 +1,9 @@
+{
+  "brokerUrl": "https://cc-cred.example.ts.net",
+  "token": "REPLACE_WITH_THIS_MACHINE_CLIENT_TOKEN",
+  "intervalSec": 1800,
+  "targets": [
+    { "cred": "personal", "type": "keychain" },
+    { "cred": "work", "type": "file", "path": "~/.claude-work/.credentials.json" }
+  ]
+}

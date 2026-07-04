@@ -1,0 +1,207 @@
+name: Publish plugin on minor version bump
+
+# When claude-plugin/.claude-plugin/plugin.json's version MAJOR or MINOR
+# segment increases vs the parent commit, mirror claude-plugin/ to the public
+# plugin repo (Dev-Jahn/ccbroker-plugin), tag it vX.Y.Z, then update
+# marketplace.json in Dev-Jahn/jahns-cc-marketplace to reference the new SHA.
+#
+# Patch bumps (0.1.0 -> 0.1.1) do NOT publish — they stay private so iteration
+# can continue without releasing each intermediate state to the public mirror.
+# Force publish anyway via workflow_dispatch with force_publish=true.
+#
+# Requires one repo secret:
+#   PUBLISH_TOKEN — fine-grained PAT with `contents: write` on BOTH
+#     Dev-Jahn/ccbroker-plugin AND Dev-Jahn/jahns-cc-marketplace
+#     (use "Only select repositories" scope, select both).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'claude-plugin/**'
+      - '.github/workflows/publish-plugin.yml'
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: 'Publish even if only patch version bumped'
+        type: boolean
+        default: false
+
+concurrency:
+  group: plugin-publish
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.vercheck.outputs.should_publish }}
+      version: ${{ steps.vercheck.outputs.version }}
+      reason: ${{ steps.vercheck.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # need parent commit for version diff
+
+      - id: vercheck
+        run: |
+          set -euo pipefail
+          NEW=$(jq -r '.version' claude-plugin/.claude-plugin/plugin.json)
+          echo "version=${NEW}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event.inputs.force_publish }}" == "true" ]]; then
+            echo "reason=force_publish=true" >> "$GITHUB_OUTPUT"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # First commit touching plugin.json → publish.
+          if ! git cat-file -e HEAD^:claude-plugin/.claude-plugin/plugin.json 2>/dev/null; then
+            echo "reason=first commit with plugin.json" >> "$GITHUB_OUTPUT"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          OLD=$(git show HEAD^:claude-plugin/.claude-plugin/plugin.json | jq -r '.version')
+          IFS='.' read -r NMa NMi NPa <<< "${NEW}"
+          IFS='.' read -r OMa OMi OPa <<< "${OLD}"
+
+          if [[ "${NMa}" != "${OMa}" ]]; then
+            echo "reason=major bump (${OLD} -> ${NEW})" >> "$GITHUB_OUTPUT"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${NMi}" != "${OMi}" ]]; then
+            echo "reason=minor bump (${OLD} -> ${NEW})" >> "$GITHUB_OUTPUT"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reason=patch-only or no bump (${OLD} -> ${NEW}); skipping publish" >> "$GITHUB_OUTPUT"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        run: |
+          echo "version = ${{ steps.vercheck.outputs.version }}"
+          echo "publish = ${{ steps.vercheck.outputs.should_publish }}"
+          echo "reason  = ${{ steps.vercheck.outputs.reason }}"
+
+  publish:
+    needs: check-version
+    if: needs.check-version.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source (private)
+        uses: actions/checkout@v4
+        with:
+          path: source
+          fetch-depth: 1
+
+      - name: Checkout public plugin mirror
+        uses: actions/checkout@v4
+        with:
+          repository: Dev-Jahn/ccbroker-plugin
+          path: public
+          token: ${{ secrets.PUBLISH_TOKEN }}
+          fetch-depth: 1
+
+      - name: Sync source/claude-plugin/ -> public/ (preserve .git + PUBLISH-side README)
+        run: |
+          set -euo pipefail
+          # Stash the public-only files we want to preserve (README.md at root,
+          # which is public-audience; PLUGIN.md is the plugin's own readme and
+          # comes from claude-plugin/README.md on sync).
+          cp public/README.md /tmp/_public_readme.md
+
+          # Mirror everything from source/claude-plugin/ to public/ root.
+          rsync -a --delete \
+            --exclude='.git' \
+            --exclude='.gitignore' \
+            source/claude-plugin/ \
+            public/
+
+          # claude-plugin/README.md lands at public/README.md; rename to
+          # PLUGIN.md so the public-audience README.md isn't overwritten.
+          if [[ -f public/README.md ]]; then
+            mv public/README.md public/PLUGIN.md
+          fi
+          cp /tmp/_public_readme.md public/README.md
+
+      - name: Commit + tag + push public mirror
+        working-directory: public
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.check-version.outputs.version }}"
+          git config user.name 'ccbroker-publish-bot'
+          git config user.email 'ccbroker-publish-bot@users.noreply.github.com'
+
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "no diff vs public mirror; maybe already published at this version"
+            echo "PUBLISHED_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          SOURCE_SHA=$(git -C ../source rev-parse --short HEAD)
+          SOURCE_SUBJECT=$(git -C ../source log -1 --pretty=format:'%s')
+          git add .
+          printf 'release v%s\n\nSource: Dev-Jahn/cc-cred-broker@%s\nUpstream subject: %s\n\nAutomated release via publish-plugin.yml.\n' \
+            "${VERSION}" "${SOURCE_SHA}" "${SOURCE_SUBJECT}" \
+            | git commit -F -
+
+          git push origin main
+
+          # Remote-first tag check (fetch-depth:1 checkout doesn't mirror remote
+          # tags, so local rev-parse would lie). If the tag already exists on
+          # the remote, treat the release as an amendment and skip tagging;
+          # otherwise create the tag locally and push just that specific ref
+          # (avoid `--tags` so an unrelated stale local tag can't collide).
+          if git ls-remote --exit-code origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "tag v${VERSION} already exists on remote; skipping tag creation/push"
+          else
+            git tag -a "v${VERSION}" -m "ccbroker v${VERSION}"
+            git push origin "refs/tags/v${VERSION}"
+          fi
+          echo "PUBLISHED_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Checkout marketplace
+        uses: actions/checkout@v4
+        with:
+          repository: Dev-Jahn/jahns-cc-marketplace
+          path: marketplace
+          token: ${{ secrets.PUBLISH_TOKEN }}
+          fetch-depth: 1
+
+      - name: Update marketplace.json SHA + version
+        working-directory: marketplace
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.check-version.outputs.version }}"
+          SHA="${PUBLISHED_SHA}"
+          if [[ -z "${SHA}" ]]; then
+            echo "no published SHA captured — skipping marketplace update"
+            exit 0
+          fi
+
+          jq --arg sha "${SHA}" --arg ver "${VERSION}" '
+            .plugins |= map(
+              if .name == "ccbroker" then
+                .source = {"source":"url","url":"https://github.com/Dev-Jahn/ccbroker-plugin.git","sha":$sha}
+                | .version = $ver
+              else . end
+            )
+          ' .claude-plugin/marketplace.json > .claude-plugin/marketplace.json.new
+          mv .claude-plugin/marketplace.json.new .claude-plugin/marketplace.json
+
+          git config user.name 'ccbroker-publish-bot'
+          git config user.email 'ccbroker-publish-bot@users.noreply.github.com'
+          if [[ -z "$(git status --porcelain)" ]]; then
+            echo "marketplace.json already points at this version; nothing to update"
+            exit 0
+          fi
+          git add .claude-plugin/marketplace.json
+          git commit -m "ccbroker: v${VERSION} @ ${SHA:0:7}"
+          git push origin main
+
+      - name: Summary
+        run: |
+          echo "Published ccbroker v${{ needs.check-version.outputs.version }} to:"
+          echo "  https://github.com/Dev-Jahn/ccbroker-plugin/releases/tag/v${{ needs.check-version.outputs.version }}"
+          echo "Marketplace updated:"
+          echo "  https://github.com/Dev-Jahn/jahns-cc-marketplace"

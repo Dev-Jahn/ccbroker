@@ -142,8 +142,9 @@ a `refreshToken` is required. From then on the broker refreshes it.
 ## Run an agent
 
 ```sh
-ccbroker-agent pull -c agent.json   # one-shot
-ccbroker-agent run  -c agent.json   # loop on intervalSec
+ccbroker-agent pull -c agent.json        # one-shot
+ccbroker-agent run  -c agent.json        # loop on intervalSec
+ccbroker-agent use work -c agent.json    # switch the "@active" account and sync
 ```
 
 See `examples/agent.example.json`. Targets:
@@ -153,11 +154,31 @@ See `examples/agent.example.json`. Targets:
 * `{"type":"keychain"}` — macOS; updates the `Claude Code-credentials` Keychain
   item, reusing the account of the existing item.
 
-## Using it alongside CCS (profile switching)
+## Account switching with a single config dir
 
-CCS switches profiles by pointing `CLAUDE_CONFIG_DIR` at different directories,
-each with its own `.credentials.json`. The broker stays format-agnostic: give
-each managed account a name, and map names to those config dirs in the agent:
+Instead of one config dir per account (the CCS approach), keep the one
+`~/.claude` every machine already has and swap which broker credential fills
+it. A target whose `cred` is the literal `"@active"` follows the account named
+in `activeFile` (default `~/.config/ccbroker/active`), which
+`ccbroker-agent use <name>` writes before syncing immediately:
+
+```json
+"targets": [ { "cred": "@active", "type": "file", "path": "~/.claude/.credentials.json" } ]
+```
+
+```sh
+ccbroker-agent use personal -c agent.json   # ~/.claude now authenticates as "personal"
+ccbroker-agent use work     -c agent.json   # ...now as "work"
+```
+
+The periodic `run` loop keeps whatever is currently active fresh. Running
+Claude Code sessions are unaffected by a switch — they hold their access token
+in memory, and every refresh still happens only on the broker.
+
+### Or alongside CCS (profile switching)
+
+If you prefer CCS-style separate profiles, the broker stays format-agnostic:
+map credential names to each profile's `CLAUDE_CONFIG_DIR`:
 
 ```json
 "targets": [

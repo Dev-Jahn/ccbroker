@@ -5,8 +5,8 @@
   "caCertPath": "",
   "clientCertPath": "~/.config/ccbroker/pki/this-machine.crt",
   "clientKeyPath": "~/.config/ccbroker/pki/this-machine.key",
+  "activeFile": "~/.config/ccbroker/active",
   "targets": [
-    { "cred": "personal", "type": "keychain" },
-    { "cred": "work", "type": "file", "path": "~/.claude-work/.credentials.json" }
+    { "cred": "@active", "type": "file", "path": "~/.claude/.credentials.json" }
   ]
 }

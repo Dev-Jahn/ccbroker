@@ -4,8 +4,9 @@
 //
 // Usage:
 //
-//	ccbroker-agent pull -c agent.json   # one-shot sync
-//	ccbroker-agent run  -c agent.json   # sync on an interval
+//	ccbroker-agent pull -c agent.json          # one-shot sync
+//	ccbroker-agent run  -c agent.json          # sync on an interval
+//	ccbroker-agent use <name> -c agent.json    # switch the "@active" account and sync
 package main
 
 import (
@@ -30,7 +31,7 @@ const keychainService = "Claude Code-credentials"
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: ccbroker-agent {pull|run} -c agent.json")
+		fmt.Fprintln(os.Stderr, "usage: ccbroker-agent {pull|run|use <name>} -c agent.json")
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
@@ -59,6 +60,25 @@ func main() {
 		if n := syncAll(cfg, client); n > 0 {
 			os.Exit(1)
 		}
+	case "use":
+		name := ""
+		for i := 0; i < len(args); i++ {
+			if (args[i] == "-c" || args[i] == "--config") && i+1 < len(args) {
+				i++
+				continue
+			}
+			name = args[i]
+		}
+		if name == "" {
+			fatal(fmt.Errorf("usage: ccbroker-agent use <cred-name> -c agent.json"))
+		}
+		if err := writeActive(cfg.ActiveFile, name); err != nil {
+			fatal(err)
+		}
+		logf("active account -> %s", name)
+		if n := syncAll(cfg, client); n > 0 {
+			os.Exit(1)
+		}
 	case "run":
 		iv := time.Duration(cfg.IntervalSec) * time.Second
 		logf("agent started, interval=%s, targets=%d", iv, len(cfg.Targets))
@@ -75,20 +95,52 @@ func main() {
 func syncAll(cfg *config.Agent, client *http.Client) int {
 	fails := 0
 	for _, t := range cfg.Targets {
-		body, err := fetchCred(cfg, client, t.Cred)
+		name, err := resolveCred(cfg, t.Cred)
 		if err != nil {
-			logf("cred=%s FETCH_FAIL %v", t.Cred, err)
+			logf("target=%s SKIP %v", t.Type, err)
+			fails++
+			continue
+		}
+		body, err := fetchCred(cfg, client, name)
+		if err != nil {
+			logf("cred=%s FETCH_FAIL %v", name, err)
 			fails++
 			continue
 		}
 		if err := writeTarget(t, body); err != nil {
-			logf("cred=%s target=%s WRITE_FAIL %v", t.Cred, t.Type, err)
+			logf("cred=%s target=%s WRITE_FAIL %v", name, t.Type, err)
 			fails++
 			continue
 		}
-		logf("cred=%s target=%s -> %s OK", t.Cred, t.Type, t.Path)
+		logf("cred=%s target=%s -> %s OK", name, t.Type, t.Path)
 	}
 	return fails
+}
+
+// resolveCred maps the special name "@active" to the account named in the
+// activeFile (written by `use`), so one target can follow account switches.
+func resolveCred(cfg *config.Agent, cred string) (string, error) {
+	if cred != "@active" {
+		return cred, nil
+	}
+	b, err := os.ReadFile(expandHome(cfg.ActiveFile))
+	if err != nil {
+		return "", fmt.Errorf("@active unresolved (run `ccbroker-agent use <name>`): %w", err)
+	}
+	name := strings.TrimSpace(string(b))
+	if name == "" {
+		return "", fmt.Errorf("@active unresolved: %s is empty", cfg.ActiveFile)
+	}
+	return name, nil
+}
+
+// writeActive records name as the current "@active" account.
+func writeActive(path, name string) error {
+	p := expandHome(path)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(p, []byte(name+"\n"), 0o600)
 }
 
 func fetchCred(cfg *config.Agent, client *http.Client, name string) ([]byte, error) {

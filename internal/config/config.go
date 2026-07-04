@@ -72,6 +72,9 @@ type Agent struct {
 	// e.g. when the broker sits behind a reverse proxy that verifies client certs.
 	ClientCertPath string `json:"clientCertPath,omitempty"`
 	ClientKeyPath  string `json:"clientKeyPath,omitempty"`
+	// ActiveFile holds the credential name that "@active" targets resolve to;
+	// written by `ccbroker-agent use <name>`.
+	ActiveFile string `json:"activeFile,omitempty"`
 }
 
 // LoadAgent reads and validates an agent config file.
@@ -89,6 +92,9 @@ func LoadAgent(path string) (*Agent, error) {
 	}
 	if c.IntervalSec == 0 {
 		c.IntervalSec = 1800
+	}
+	if c.ActiveFile == "" {
+		c.ActiveFile = "~/.config/ccbroker/active"
 	}
 	c.BrokerURL = strings.TrimRight(c.BrokerURL, "/")
 	return &c, nil

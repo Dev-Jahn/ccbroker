@@ -199,6 +199,16 @@ func httpClient(cfg *config.Agent) (*http.Client, error) {
 		}
 		tlsCfg.RootCAs = pool
 	}
+	if cfg.ClientCertPath != "" || cfg.ClientKeyPath != "" {
+		if cfg.ClientCertPath == "" || cfg.ClientKeyPath == "" {
+			return nil, fmt.Errorf("clientCertPath and clientKeyPath must both be set for mTLS")
+		}
+		cert, err := tls.LoadX509KeyPair(expandHome(cfg.ClientCertPath), expandHome(cfg.ClientKeyPath))
+		if err != nil {
+			return nil, fmt.Errorf("load client cert: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
 	return &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: tlsCfg},

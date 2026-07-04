@@ -68,6 +68,10 @@ type Agent struct {
 	Targets     []Target `json:"targets"`
 	CACertPath  string   `json:"caCertPath,omitempty"`
 	Insecure    bool     `json:"insecure,omitempty"`
+	// ClientCertPath/ClientKeyPath present a TLS client certificate for mTLS,
+	// e.g. when the broker sits behind a reverse proxy that verifies client certs.
+	ClientCertPath string `json:"clientCertPath,omitempty"`
+	ClientKeyPath  string `json:"clientKeyPath,omitempty"`
 }
 
 // LoadAgent reads and validates an agent config file.

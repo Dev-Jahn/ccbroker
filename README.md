@@ -57,8 +57,11 @@ broker uses.
 
 ## Security model
 
-* **No public exposure.** Designed to run behind a private tunnel
-  (Tailscale/WireGuard). The credential API is only as reachable as your tunnel.
+* **Private by default.** Meant to run behind a private tunnel
+  (Tailscale/WireGuard); the credential API is then only as reachable as your
+  tunnel. If you must expose it publicly, put it behind a reverse proxy that
+  enforces **mTLS** so the bearer token is never the only thing between the
+  internet and your credentials (see below).
 * **Encrypted at rest.** The store is AES-256-GCM with a 32-byte master key kept
   in a separate `0600` file.
 * **Per-client bearer tokens, hashed at rest.** The config stores only
@@ -66,6 +69,30 @@ broker uses.
   limiting which credential names it may read. Every access is written to an
   audit log.
 * **Admin API is localhost-only** and separately authenticated.
+
+### Public exposure behind a reverse proxy (mTLS)
+
+To reach the broker from machines that can't share a tunnel (e.g. a tagged
+Tailscale host), terminate TLS on a reverse proxy at your own domain and require
+a client certificate there — the proxy rejects anyone without a cert before the
+request ever reaches the broker, and the app-layer bearer + scope still apply.
+Because TLS terminates on your own proxy, no third party sees the credential
+bodies. The agent presents its cert via `clientCertPath` / `clientKeyPath`:
+
+```json
+{ "brokerUrl": "https://cc-cred.example.com",
+  "token": "…", "clientCertPath": "~/.config/ccbroker/pki/host.crt",
+  "clientKeyPath": "~/.config/ccbroker/pki/host.key", "targets": [ … ] }
+```
+
+nginx (e.g. via Nginx Proxy Manager's advanced config), trusting your client CA:
+
+```nginx
+ssl_client_certificate /data/custom_ssl/cc-cred-client-ca.pem;
+ssl_verify_client on;
+```
+
+Keep the admin API off the proxy — it stays localhost-only on the broker host.
 
 ## Build
 

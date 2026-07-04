@@ -35,6 +35,15 @@ type Server struct {
 	mu       sync.Mutex
 	inflight map[string]*sync.Mutex // per-cred single-flight refresh
 	backoff  map[string]time.Time   // per-cred next-allowed-attempt after transient failure
+
+	usageMu sync.Mutex
+	usage   map[string]*usageEntry // per-cred latest quota snapshot
+}
+
+type usageEntry struct {
+	Usage     *anthropic.Usage
+	FetchedAt int64 // unix ms
+	LastError string
 }
 
 // New constructs a Server and opens the audit log.
@@ -54,6 +63,7 @@ func New(cfg *config.Server, st *store.Store) (*Server, error) {
 		skew:     time.Duration(cfg.RefreshSkewSec) * time.Second,
 		inflight: map[string]*sync.Mutex{},
 		backoff:  map[string]time.Time{},
+		usage:    map[string]*usageEntry{},
 	}, nil
 }
 
@@ -193,6 +203,54 @@ func (s *Server) refreshDue(ctx context.Context) {
 	}
 }
 
+// ---- usage polling (quota, no message-quota cost) ----
+
+// RunUsageLoop polls the OAuth usage endpoint for every live credential so
+// clients can make quota-aware account choices. Polling reads utilization
+// only; it never consumes message quota and never touches the refresh chain.
+func (s *Server) RunUsageLoop(ctx context.Context) {
+	iv := time.Duration(s.cfg.UsagePollSec) * time.Second
+	t := time.NewTicker(iv)
+	defer t.Stop()
+	s.pollUsage(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.pollUsage(ctx)
+		}
+	}
+}
+
+func (s *Server) pollUsage(ctx context.Context) {
+	for _, rec := range s.store.List() {
+		if rec.Dead || rec.ExpiresAtMs() <= time.Now().UnixMilli() {
+			continue // no valid access token to query with; refresh loop will fix
+		}
+		cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		u, err := anthropic.FetchUsage(cctx, rec.AccessToken())
+		cancel()
+		s.usageMu.Lock()
+		e := s.usage[rec.Name]
+		if e == nil {
+			e = &usageEntry{}
+			s.usage[rec.Name] = e
+		}
+		if err != nil {
+			e.LastError = err.Error()
+		} else {
+			e.Usage = u
+			e.FetchedAt = time.Now().UnixMilli()
+			e.LastError = ""
+		}
+		s.usageMu.Unlock()
+		if err != nil {
+			s.audit.Printf("USAGE name=%s result=ERR err=%v", rec.Name, err)
+		}
+	}
+}
+
 // ---- credential API (bearer + scope) ----
 
 func (s *Server) authClient(r *http.Request) (*config.Client, bool) {
@@ -273,6 +331,45 @@ func (s *Server) handleGetCred(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(body)
 	s.audit.Printf("GET name=%s client=%s ip=%s result=OK expiresAt=%d", name, client.Name, ip, rec.ExpiresAtMs())
+}
+
+// handleUsage returns quota snapshots for every credential the client's scope
+// allows — enough for a client to pick the least-utilized account. It never
+// includes tokens.
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	client, ok := s.authClient(r)
+	if !ok {
+		s.audit.Printf("USAGE-API client=? ip=%s result=UNAUTHORIZED", ip)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	type row struct {
+		Name           string           `json:"name"`
+		Account        string           `json:"account,omitempty"`
+		Dead           bool             `json:"dead,omitempty"`
+		ExpiresAt      int64            `json:"expiresAt"`
+		Usage          *anthropic.Usage `json:"usage,omitempty"`
+		UsageFetchedAt int64            `json:"usageFetchedAt,omitempty"`
+		UsageError     string           `json:"usageError,omitempty"`
+	}
+	out := []row{}
+	for _, rec := range s.store.List() {
+		if !scopeAllows(client, rec.Name) {
+			continue
+		}
+		rw := row{Name: rec.Name, Account: rec.Account, Dead: rec.Dead, ExpiresAt: rec.ExpiresAtMs()}
+		s.usageMu.Lock()
+		if e := s.usage[rec.Name]; e != nil {
+			rw.Usage = e.Usage
+			rw.UsageFetchedAt = e.FetchedAt
+			rw.UsageError = e.LastError
+		}
+		s.usageMu.Unlock()
+		out = append(out, rw)
+	}
+	s.audit.Printf("USAGE-API client=%s ip=%s result=OK creds=%d", client.Name, ip, len(out))
+	writeJSON(w, http.StatusOK, map[string]any{"credentials": out})
 }
 
 // ---- admin API (localhost, admin token) ----
@@ -412,6 +509,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	credMux := http.NewServeMux()
 	credMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	credMux.HandleFunc("/v1/credentials/", s.handleGetCred)
+	credMux.HandleFunc("/v1/usage", s.handleUsage)
 
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("/admin/creds", s.handleAdmin)

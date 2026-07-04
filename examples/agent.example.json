@@ -6,6 +6,8 @@
   "clientCertPath": "~/.config/ccbroker/pki/this-machine.crt",
   "clientKeyPath": "~/.config/ccbroker/pki/this-machine.key",
   "activeFile": "~/.config/ccbroker/active",
+  "auto": false,
+  "autoThreshold": 0.95,
   "targets": [
     { "cred": "@active", "type": "file", "path": "~/.claude/.credentials.json" }
   ]

@@ -91,6 +91,7 @@ func serve(args []string) {
 	defer stop()
 
 	go srv.RunRefreshLoop(ctx)
+	go srv.RunUsageLoop(ctx)
 	if err := srv.Serve(ctx); err != nil {
 		fatal(err)
 	}

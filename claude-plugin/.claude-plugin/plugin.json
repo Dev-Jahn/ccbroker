@@ -1,0 +1,8 @@
+{
+  "name": "ccbroker",
+  "version": "0.1.0",
+  "description": "Claude account switching and quota status via cc-cred-broker (requires the `ccb` binary on PATH)",
+  "repository": "https://github.com/Dev-Jahn/cc-cred-broker",
+  "license": "MIT",
+  "keywords": ["credentials", "accounts", "quota"]
+}

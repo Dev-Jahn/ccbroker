@@ -99,12 +99,12 @@ Keep the admin API off the proxy — it stays localhost-only on the broker host.
 Pure standard library, no external Go dependencies.
 
 ```sh
-go build -o ccbrokerd       ./cmd/ccbrokerd
-go build -o ccbroker-agent  ./cmd/ccbroker-agent
+go build -o ccbrokerd ./cmd/ccbrokerd
+go build -o ccb       ./cmd/ccb
 
-# cross-compile an agent for another machine
-GOOS=darwin GOARCH=arm64 go build -o ccbroker-agent.darwin-arm64 ./cmd/ccbroker-agent
-GOOS=linux  GOARCH=amd64 go build -o ccbroker-agent.linux-amd64  ./cmd/ccbroker-agent
+# cross-compile the client for another machine
+GOOS=darwin GOARCH=arm64 go build -o ccb.darwin-arm64 ./cmd/ccb
+GOOS=linux  GOARCH=amd64 go build -o ccb.linux-amd64  ./cmd/ccb
 ```
 
 ## Run the broker
@@ -139,12 +139,15 @@ curl -sS -X PUT -H "X-Admin-Token: $ADMIN_TOKEN" \
 The body may be a full `{"claudeAiOauth": {...}}` file or the bare oauth object;
 a `refreshToken` is required. From then on the broker refreshes it.
 
-## Run an agent
+## Run the client (`ccb`)
 
 ```sh
-ccbroker-agent pull -c agent.json        # one-shot
-ccbroker-agent run  -c agent.json        # loop on intervalSec
-ccbroker-agent use work -c agent.json    # switch the "@active" account and sync
+ccb pull          # one-shot sync (default config: ~/.config/ccbroker/agent.json)
+ccb run           # loop on intervalSec
+ccb use work      # switch the "@active" account and sync
+ccb auto          # switch to the least-utilized account and sync
+ccb status        # quota table for all accounts in scope
+ccb statusline    # one-line summary for a Claude Code statusLine
 ```
 
 See `examples/agent.example.json`. Targets:
@@ -160,20 +163,58 @@ Instead of one config dir per account (the CCS approach), keep the one
 `~/.claude` every machine already has and swap which broker credential fills
 it. A target whose `cred` is the literal `"@active"` follows the account named
 in `activeFile` (default `~/.config/ccbroker/active`), which
-`ccbroker-agent use <name>` writes before syncing immediately:
+`ccb use <name>` writes before syncing immediately:
 
 ```json
 "targets": [ { "cred": "@active", "type": "file", "path": "~/.claude/.credentials.json" } ]
 ```
 
 ```sh
-ccbroker-agent use personal -c agent.json   # ~/.claude now authenticates as "personal"
-ccbroker-agent use work     -c agent.json   # ...now as "work"
+ccb use personal   # ~/.claude now authenticates as "personal"
+ccb use work       # ...now as "work"
 ```
 
 The periodic `run` loop keeps whatever is currently active fresh. Running
 Claude Code sessions are unaffected by a switch — they hold their access token
 in memory, and every refresh still happens only on the broker.
+
+## Quota-aware rotation
+
+The broker polls `GET api.anthropic.com/api/oauth/usage` for every credential
+(the endpoint reports 5-hour / 7-day / per-model-weekly utilization **without
+consuming message quota**) and serves the snapshots at `/v1/usage`. On top of
+that:
+
+* `ccb status` — utilization table for every account your token can read.
+* `ccb auto` — keep the active account while it is under `autoThreshold`
+  (default 0.95), otherwise switch to the least-utilized live account.
+* `"auto": true` in `agent.json` — `pull`/`run` do the same check every cycle,
+  so a cron'd `ccb pull` rotates accounts before they hit the limit.
+
+## Claude Code statusline
+
+`ccb statusline` prints a one-line summary of the active account from the
+cached snapshot (no network in the hot path):
+
+```
+gptaku 5h:16% 7d:62%
+```
+
+Install it as your Claude Code statusline (refuses to overwrite an existing
+statusLine — in that case call `ccb statusline` from your own script):
+
+```sh
+ccb statusline --install               # writes statusLine into ~/.claude/settings.json
+ccb statusline --install --settings ~/.claude-work/settings.json
+```
+
+## Claude Code plugin
+
+`claude-plugin/` is a minimal Claude Code plugin exposing `/ccb-status`,
+`/ccb-use <name>` and `/ccb-auto` as slash commands plus a SessionStart hook
+that runs `ccb pull` (fresh token + fresh quota cache at session start). It
+requires `ccb` on PATH. Statuslines are not a plugin surface in Claude Code —
+use `ccb statusline --install` for that.
 
 ### Or alongside CCS (profile switching)
 
@@ -195,6 +236,7 @@ CCS keeps switching profiles; the agent keeps each profile's token fresh.
 |--------|------|------|---------|
 | GET | `/healthz` | none | liveness |
 | GET | `/v1/credentials/{name}` | `Authorization: Bearer <token>` + scope | current `.credentials.json` for `name` |
+| GET | `/v1/usage` | `Authorization: Bearer <token>` | quota snapshots for all creds in scope (no tokens) |
 | PUT | `/admin/creds/{name}` | `X-Admin-Token` (localhost) | import/replace a credential |
 | GET | `/admin/creds` | `X-Admin-Token` (localhost) | list (redacted) |
 | DELETE | `/admin/creds/{name}` | `X-Admin-Token` (localhost) | remove |

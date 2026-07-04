@@ -25,6 +25,7 @@ type Server struct {
 	KeyPath        string   `json:"keyPath"` // 32-byte master key, hex-encoded
 	AuditLog       string   `json:"auditLog"`
 	RefreshSkewSec int64    `json:"refreshSkewSec"` // refresh when within N sec of expiry
+	UsagePollSec   int64    `json:"usagePollSec"`   // poll quota usage every N sec
 	Clients        []Client `json:"clients"`
 }
 
@@ -46,6 +47,9 @@ func LoadServer(path string) (*Server, error) {
 	}
 	if c.RefreshSkewSec == 0 {
 		c.RefreshSkewSec = 600
+	}
+	if c.UsagePollSec == 0 {
+		c.UsagePollSec = 300
 	}
 	if c.StorePath == "" || c.KeyPath == "" {
 		return nil, fmt.Errorf("storePath and keyPath are required")
@@ -73,8 +77,12 @@ type Agent struct {
 	ClientCertPath string `json:"clientCertPath,omitempty"`
 	ClientKeyPath  string `json:"clientKeyPath,omitempty"`
 	// ActiveFile holds the credential name that "@active" targets resolve to;
-	// written by `ccbroker-agent use <name>`.
+	// written by `ccb use <name>`.
 	ActiveFile string `json:"activeFile,omitempty"`
+	// Auto makes pull/run auto-switch the active account to the least-utilized
+	// one whenever the current account reaches AutoThreshold.
+	Auto          bool    `json:"auto,omitempty"`
+	AutoThreshold float64 `json:"autoThreshold,omitempty"` // default 0.95
 }
 
 // LoadAgent reads and validates an agent config file.
@@ -95,6 +103,9 @@ func LoadAgent(path string) (*Agent, error) {
 	}
 	if c.ActiveFile == "" {
 		c.ActiveFile = "~/.config/ccbroker/active"
+	}
+	if c.AutoThreshold == 0 {
+		c.AutoThreshold = 0.95
 	}
 	c.BrokerURL = strings.TrimRight(c.BrokerURL, "/")
 	return &c, nil

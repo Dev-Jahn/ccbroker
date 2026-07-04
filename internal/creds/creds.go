@@ -50,7 +50,9 @@ func (r *Record) ExpiresAtMs() int64 {
 	return 0
 }
 
-// FileBytes renders the record as a .credentials.json payload.
+// FileBytes renders the record as a .credentials.json payload. Compact,
+// single-line JSON matching Claude Code's native format (a multiline value in
+// the macOS keychain would also display as hex in `security -w`).
 func (r *Record) FileBytes() ([]byte, error) {
-	return json.MarshalIndent(File{ClaudeAiOauth: r.OAuth}, "", "  ")
+	return json.Marshal(File{ClaudeAiOauth: r.OAuth})
 }

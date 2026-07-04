@@ -42,6 +42,18 @@ func (u *Usage) MaxUtilization() float64 {
 	return max
 }
 
+// MaxUtilizationAll returns the highest utilization across every window,
+// including model-scoped weekly buckets (used by the "all" rotation policy).
+func (u *Usage) MaxUtilizationAll() float64 {
+	max := u.MaxUtilization()
+	for _, b := range u.ScopedWeekly {
+		if b.Utilization > max {
+			max = b.Utilization
+		}
+	}
+	return max
+}
+
 // rawBucket tolerates the field spellings the endpoint has used.
 type rawBucket struct {
 	Utilization    *float64        `json:"utilization"`

@@ -19,14 +19,17 @@ import (
 	"strings"
 	"syscall"
 
-	"ccbroker/internal/config"
-	"ccbroker/internal/server"
-	"ccbroker/internal/store"
+	"github.com/Dev-Jahn/ccbroker/internal/config"
+	"github.com/Dev-Jahn/ccbroker/internal/server"
+	"github.com/Dev-Jahn/ccbroker/internal/store"
 )
+
+// version is stamped at release time via -ldflags "-X main.version=...".
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: ccbrokerd {genkey|hashtoken|serve} [args]")
+		fmt.Fprintln(os.Stderr, "usage: ccbrokerd {genkey|hashtoken|serve|version} [args]")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -36,6 +39,8 @@ func main() {
 		hashtoken()
 	case "serve":
 		serve(os.Args[2:])
+	case "version":
+		fmt.Printf("ccbrokerd %s\n", version)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)

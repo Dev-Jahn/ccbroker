@@ -17,7 +17,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"ccbroker/internal/creds"
+	"github.com/Dev-Jahn/ccbroker/internal/creds"
 )
 
 type Store struct {

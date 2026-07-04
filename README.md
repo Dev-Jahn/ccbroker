@@ -1,4 +1,10 @@
-# cc-cred-broker
+# ccbroker
+
+Self-hosted broker that centrally refreshes Claude Code OAuth credentials for
+all your machines, with quota-aware multi-account rotation.
+
+[![CI](https://github.com/Dev-Jahn/ccbroker/actions/workflows/ci.yml/badge.svg)](https://github.com/Dev-Jahn/ccbroker/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A small self-hosted broker that holds Claude Code (Anthropic subscription)
 OAuth credentials **centrally**, refreshes each one in a **single place**, and
@@ -31,7 +37,7 @@ machine read from it. That component is this broker.
                  └───────────────────────────────┬────────────────────────────┘
                           (private tunnel, e.g. Tailscale / WireGuard)
               ┌───────────────────────────────────┼───────────────────────────┐
-        ccbroker-agent                       ccbroker-agent               ccbroker-agent
+        ccb                                  ccb                          ccb
         (macOS: Keychain)                    (Linux: file)                (Linux: file)
         writes "Claude Code-credentials"     ~/.claude/.credentials.json  ~/.claude-work/...
 ```
@@ -41,7 +47,7 @@ machine read from it. That component is this broker.
   failures, marks a credential dead on `invalid_grant`), and serves them over a
   bearer-authenticated, scope-limited API. A separate localhost-only admin API
   imports / lists / deletes / force-refreshes credentials.
-* **`ccbroker-agent`** — the client. Pulls named credentials on an interval and
+* **`ccb`** — the client. Pulls named credentials on an interval and
   writes them to local destinations: a `.credentials.json` file (Linux) or the
   macOS Keychain item Claude Code reads (`Claude Code-credentials`). Because the
   agent keeps the local token fresh, Claude Code never needs to refresh it
@@ -55,59 +61,55 @@ sits behind a Cloudflare managed challenge that blocks non-browser clients.
 `grant_type=refresh_token` exchange without the challenge, which is what the
 broker uses.
 
-## Security model
+## Install
 
-* **Private by default.** Meant to run behind a private tunnel
-  (Tailscale/WireGuard); the credential API is then only as reachable as your
-  tunnel. If you must expose it publicly, put it behind a reverse proxy that
-  enforces **mTLS** so the bearer token is never the only thing between the
-  internet and your credentials (see below).
-* **Encrypted at rest.** The store is AES-256-GCM with a 32-byte master key kept
-  in a separate `0600` file.
-* **Per-client bearer tokens, hashed at rest.** The config stores only
-  `sha256(token)`; comparison is constant-time. Each client has **scopes**
-  limiting which credential names it may read. Every access is written to an
-  audit log.
-* **Admin API is localhost-only** and separately authenticated.
-
-### Public exposure behind a reverse proxy (mTLS)
-
-To reach the broker from machines that can't share a tunnel (e.g. a tagged
-Tailscale host), terminate TLS on a reverse proxy at your own domain and require
-a client certificate there — the proxy rejects anyone without a cert before the
-request ever reaches the broker, and the app-layer bearer + scope still apply.
-Because TLS terminates on your own proxy, no third party sees the credential
-bodies. The agent presents its cert via `clientCertPath` / `clientKeyPath`:
-
-```json
-{ "brokerUrl": "https://cc-cred.example.com",
-  "token": "…", "clientCertPath": "~/.config/ccbroker/pki/host.crt",
-  "clientKeyPath": "~/.config/ccbroker/pki/host.key", "targets": [ … ] }
-```
-
-nginx (e.g. via Nginx Proxy Manager's advanced config), trusting your client CA:
-
-```nginx
-ssl_client_certificate /data/custom_ssl/cc-cred-client-ca.pem;
-ssl_verify_client on;
-```
-
-Keep the admin API off the proxy — it stays localhost-only on the broker host.
-
-## Build
-
-Pure standard library, no external Go dependencies.
+**Client** (`ccb`) — macOS or Linux:
 
 ```sh
-go build -o ccbrokerd ./cmd/ccbrokerd
-go build -o ccb       ./cmd/ccb
-
-# cross-compile the client for another machine
-GOOS=darwin GOARCH=arm64 go build -o ccb.darwin-arm64 ./cmd/ccb
-GOOS=linux  GOARCH=amd64 go build -o ccb.linux-amd64  ./cmd/ccb
+curl -fsSL https://raw.githubusercontent.com/Dev-Jahn/ccbroker/main/install.sh | sh
+ccb setup
 ```
 
+`install.sh` downloads the release binary for your OS/arch, verifies it against
+`checksums.txt`, and installs it to `~/.local/bin` (override with
+`CCB_INSTALL_DIR`); `ccb setup` then walks you through the client config.
+
+**Broker** (`ccbrokerd`) — Linux with systemd, run as root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dev-Jahn/ccbroker/main/install-server.sh | sudo sh
+```
+
+`install-server.sh` installs `ccbrokerd`, generates a master key, an admin token
+and a first client token, writes `/etc/ccbroker/config.json`, installs and starts
+the systemd service, and prints the tokens once.
+
+**Manual.** Grab a prebuilt binary for your platform from the
+[releases page](https://github.com/Dev-Jahn/ccbroker/releases) (assets are named
+`ccb_<os>_<arch>` / `ccbrokerd_linux_<arch>`, with a `checksums.txt`), or build
+the client with Go:
+
+```sh
+go install github.com/Dev-Jahn/ccbroker/cmd/ccb@latest
+```
+
+## Quickstart
+
+1. **Bring the broker up** on a server you control — the server one-liner above
+   sets up `ccbrokerd`, a config and a systemd unit, and prints an admin token
+   and a client token.
+2. **Import a credential** from an existing Claude login (see
+   [Import a credential](#import-a-credential)).
+3. **On each machine**, install the client and run `ccb setup` — it asks for the
+   broker URL and client token, writes `agent.json`, and offers to install a
+   launchd/systemd job that keeps the credential fresh.
+4. **Done.** Claude Code on that machine now reads a token the broker refreshes;
+   use `ccb status` / `ccb use` / `ccb policy` to manage accounts.
+
 ## Run the broker
+
+The [server one-liner](#install) (`install-server.sh`) does all of this for you.
+To set the broker up by hand:
 
 ```sh
 # 1. master key
@@ -121,9 +123,6 @@ printf %s "$TOKEN" | ccbrokerd hashtoken     # -> put in config.json clients[].t
 # 3. config.json (see examples/config.example.json), then:
 ccbrokerd serve -c /etc/ccbroker/config.json
 ```
-
-See `deploy/setup.sh` for a full first-time setup and `deploy/ccbrokerd.service`
-for a systemd unit.
 
 ### Import a credential
 
@@ -142,12 +141,15 @@ a `refreshToken` is required. From then on the broker refreshes it.
 ## Run the client (`ccb`)
 
 ```sh
+ccb setup         # interactive first-run wizard: writes agent.json, offers a scheduler
 ccb pull          # one-shot sync (default config: ~/.config/ccbroker/agent.json)
 ccb run           # loop on intervalSec
 ccb use work      # switch the "@active" account and sync
 ccb auto          # switch to the least-utilized account and sync
 ccb status        # quota table for all accounts in scope
 ccb statusline    # one-line summary for a Claude Code statusLine
+ccb policy all    # show or set the auto-rotation policy (manual|account|all)
+ccb version       # print the ccb version
 ```
 
 See `examples/agent.example.json`. Targets:
@@ -178,18 +180,40 @@ The periodic `run` loop keeps whatever is currently active fresh. Running
 Claude Code sessions are unaffected by a switch — they hold their access token
 in memory, and every refresh still happens only on the broker.
 
-## Quota-aware rotation
+## Rotation policies
 
 The broker polls `GET api.anthropic.com/api/oauth/usage` for every credential
 (the endpoint reports 5-hour / 7-day / per-model-weekly utilization **without
-consuming message quota**) and serves the snapshots at `/v1/usage`. On top of
-that:
+consuming message quota**) and serves the snapshots at `/v1/usage`. `ccb status`
+renders them; `ccb auto`, and `pull`/`run` when a rotation policy is active, use
+them to pick the active account.
 
-* `ccb status` — utilization table for every account your token can read.
-* `ccb auto` — keep the active account while it is under `autoThreshold`
-  (default 0.95), otherwise switch to the least-utilized live account.
-* `"auto": true` in `agent.json` — `pull`/`run` do the same check every cycle,
-  so a cron'd `ccb pull` rotates accounts before they hit the limit.
+The **rotation policy** decides which quota windows can trigger an auto-switch:
+
+| Policy | Switches the active account when… |
+|--------|-----------------------------------|
+| `manual` | never — you switch yourself with `ccb use <name>` |
+| `account` | the account-wide 5-hour **or** 7-day window reaches `autoThreshold` (default 0.95) |
+| `all` | any of the above **or** any per-model weekly bucket reaches the threshold |
+
+**The per-model trap.** The account-wide 5h/7d windows can look healthy while a
+single model's weekly bucket is already exhausted — top-tier models often carry
+their own weekly limit. `account` **ignores model buckets by design**: a spent
+per-model bucket does not block your other models, so rotating away from an
+otherwise-fine account would waste its remaining capacity. Choose `all` only if
+your workflow depends on one specific model and you would rather switch accounts
+the moment that model's weekly bucket runs out.
+
+Change the policy any time:
+
+```sh
+ccb policy            # show the effective policy and where it came from
+ccb policy all        # set it (manual | account | all)
+```
+
+or run `/ccb-policy` in the Claude Code plugin, or edit `autoPolicy` in
+`agent.json`. The legacy `"auto": true` flag still works and is equivalent to
+`account`.
 
 ## Claude Code statusline
 
@@ -197,7 +221,7 @@ that:
 cached snapshot (no network in the hot path):
 
 ```
-gptaku 5h:16% 7d:62%
+personal 5h:16% 7d:62%
 ```
 
 Install it as your Claude Code statusline (refuses to overwrite an existing
@@ -211,10 +235,17 @@ ccb statusline --install --settings ~/.claude-work/settings.json
 ## Claude Code plugin
 
 `claude-plugin/` is a minimal Claude Code plugin exposing `/ccb-status`,
-`/ccb-use <name>` and `/ccb-auto` as slash commands plus a SessionStart hook
-that runs `ccb pull` (fresh token + fresh quota cache at session start). It
-requires `ccb` on PATH. Statuslines are not a plugin surface in Claude Code —
-use `ccb statusline --install` for that.
+`/ccb-use <name>`, `/ccb-auto` and `/ccb-policy [manual|account|all]` as slash
+commands plus a SessionStart hook that runs `ccb pull` (fresh token + fresh
+quota cache at session start). It requires `ccb` on PATH. Statuslines are not a
+plugin surface in Claude Code — use `ccb statusline --install` for that.
+
+Install it from the marketplace:
+
+```
+/plugin marketplace add Dev-Jahn/jahns-cc-marketplace
+/plugin install ccbroker
+```
 
 ### Or alongside CCS (profile switching)
 
@@ -229,6 +260,50 @@ map credential names to each profile's `CLAUDE_CONFIG_DIR`:
 ```
 
 CCS keeps switching profiles; the agent keeps each profile's token fresh.
+
+## Public exposure behind a reverse proxy (mTLS)
+
+To reach the broker from machines that can't share a tunnel (e.g. a tagged
+Tailscale host), terminate TLS on a reverse proxy at your own domain and require
+a client certificate there — the proxy rejects anyone without a cert before the
+request ever reaches the broker, and the app-layer bearer + scope still apply.
+Because TLS terminates on your own proxy, no third party sees the credential
+bodies. The agent presents its cert via `clientCertPath` / `clientKeyPath`:
+
+```json
+{ "brokerUrl": "https://ccbroker.example.com",
+  "token": "…", "clientCertPath": "~/.config/ccbroker/pki/host.crt",
+  "clientKeyPath": "~/.config/ccbroker/pki/host.key", "targets": [ … ] }
+```
+
+nginx (e.g. via Nginx Proxy Manager's advanced config), trusting your client CA:
+
+```nginx
+ssl_client_certificate /data/custom_ssl/ccbroker-client-ca.pem;
+ssl_verify_client on;
+```
+
+Keep the admin API off the proxy — it stays localhost-only on the broker host.
+
+## Security model
+
+* **Private by default.** Meant to run behind a private tunnel
+  (Tailscale/WireGuard); the credential API is then only as reachable as your
+  tunnel. If you must expose it publicly, put it behind a reverse proxy that
+  enforces **mTLS** so the bearer token is never the only thing between the
+  internet and your credentials (see the reverse-proxy section above).
+* **Encrypted at rest.** The store is AES-256-GCM with a 32-byte master key kept
+  in a separate `0600` file.
+* **Per-client bearer tokens, hashed at rest.** The config stores only
+  `sha256(token)`; comparison is constant-time. Each client has **scopes**
+  limiting which credential names it may read. Every access is written to an
+  audit log.
+* **Admin API is localhost-only** and separately authenticated.
+* **Canonical sources.** The only official sources for `ccbroker` binaries are
+  this repository and its
+  [GitHub Releases](https://github.com/Dev-Jahn/ccbroker/releases) (which
+  `install.sh` / `install-server.sh` verify against `checksums.txt`). Do not run
+  binaries for this tool from anywhere else.
 
 ## API
 
@@ -258,3 +333,7 @@ from under it); it returns `503` instead so the client keeps its last good copy.
 * **Master key.** If the key file is lost the store cannot be decrypted; the
   only cost is re-importing credentials (re-login), but back the key up
   somewhere safe.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,16 +1,19 @@
-// Command ccb is the cc-cred-broker client: it pulls credentials from the
+// Command ccb is the ccbroker client: it pulls credentials from the
 // broker, keeps local destinations in sync, switches the active account, and
 // reports quota status.
 //
 // Usage:
 //
-//	ccb pull        [-c agent.json]   # one-shot sync (+auto-rotate if "auto": true)
+//	ccb pull        [-c agent.json]   # one-shot sync (+auto-rotate per policy)
 //	ccb run         [-c agent.json]   # sync on an interval
 //	ccb use <name>  [-c agent.json]   # switch the "@active" account and sync
 //	ccb auto        [-c agent.json]   # switch to the least-utilized account and sync
 //	ccb status      [-c agent.json]   # quota table for all accounts in scope
 //	ccb statusline  [-c agent.json]   # one-line summary from cache (for Claude Code statusLine)
 //	ccb statusline --install [--settings <path>]  # register as Claude Code statusLine
+//	ccb policy [manual|account|all] [-c agent.json]  # show or set the auto-rotation policy
+//	ccb setup       [-c agent.json]   # interactive first-run wizard
+//	ccb version                       # print the ccb version
 package main
 
 import (
@@ -30,15 +33,18 @@ import (
 	"strings"
 	"time"
 
-	"ccbroker/internal/anthropic"
-	"ccbroker/internal/config"
+	"github.com/Dev-Jahn/ccbroker/internal/anthropic"
+	"github.com/Dev-Jahn/ccbroker/internal/config"
 )
 
 const keychainService = "Claude Code-credentials"
 
+// version is stamped at release time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: ccb {pull|run|use <name>|auto|status|statusline} [-c agent.json]")
+		fmt.Fprintln(os.Stderr, "usage: ccb {pull|run|use <name>|auto|status|statusline|policy [value]|setup|version} [-c agent.json]")
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
@@ -69,6 +75,24 @@ func main() {
 		return
 	}
 
+	// These run before LoadAgent: version needs no config, and setup/policy
+	// manage the config file themselves (setup even creates it).
+	switch cmd {
+	case "version":
+		fmt.Printf("ccb %s\n", version)
+		return
+	case "setup":
+		if err := runSetup(cfgPath, os.Stdin, os.Stdout); err != nil {
+			fatal(err)
+		}
+		return
+	case "policy":
+		if err := runPolicy(cfgPath, positional); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
 	cfg, err := config.LoadAgent(cfgPath)
 	if err != nil {
 		fatal(err)
@@ -91,7 +115,7 @@ func main() {
 		}
 	case "run":
 		iv := time.Duration(cfg.IntervalSec) * time.Second
-		logf("agent started, interval=%s, targets=%d, auto=%v", iv, len(cfg.Targets), cfg.Auto)
+		logf("agent started, interval=%s, targets=%d, policy=%s", iv, len(cfg.Targets), cfg.EffectivePolicy())
 		for {
 			syncCycle(cfg, client, false)
 			time.Sleep(iv)
@@ -127,6 +151,68 @@ func defaultConfigPath() string {
 	return expandHome("~/.config/ccbroker/agent.json")
 }
 
+// runPolicy shows or sets the auto-rotation policy in agent.json. With no
+// argument it prints the effective policy and where it comes from; with an
+// argument it rewrites "autoPolicy" and drops the legacy "auto" key, leaving
+// every other field untouched.
+func runPolicy(cfgPath string, args []string) error {
+	p := expandHome(cfgPath)
+	if len(args) == 0 {
+		cfg, err := config.LoadAgent(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("no config at %s (run `ccb setup`)", p)
+			}
+			return err
+		}
+		src := "(default)"
+		switch {
+		case cfg.AutoPolicy != "":
+			src = "(from autoPolicy)"
+		case cfg.Auto:
+			src = `(from legacy "auto": true)`
+		}
+		fmt.Printf("policy: %s (threshold %g)\n", cfg.EffectivePolicy(), cfg.AutoThreshold)
+		fmt.Println(src)
+		return nil
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("usage: ccb policy [manual|account|all] [-c agent.json]")
+	}
+	val := args[0]
+	switch val {
+	case "manual", "account", "all":
+	default:
+		return fmt.Errorf("policy must be manual, account or all (got %q)", val)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no config at %s (run `ccb setup`)", p)
+		}
+		return err
+	}
+	// UseNumber so large integers round-trip exactly instead of degrading to
+	// float64 (e.g. intervalSec 1800 must not become 1.8e+03) when rewritten.
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	m := map[string]any{}
+	if err := dec.Decode(&m); err != nil {
+		return fmt.Errorf("%s not valid JSON: %w", p, err)
+	}
+	m["autoPolicy"] = val
+	delete(m, "auto")
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeFile(p, append(out, '\n')); err != nil {
+		return err
+	}
+	fmt.Printf("auto-rotation policy -> %s\n", val)
+	return nil
+}
+
 // syncCycle refreshes the quota cache, optionally auto-rotates the active
 // account, and syncs every target. forceAuto rotates even when cfg.Auto is
 // off (the `auto` subcommand). Returns the number of failures.
@@ -135,8 +221,12 @@ func syncCycle(cfg *config.Agent, client *http.Client, forceAuto bool) int {
 	if err != nil {
 		logf("usage fetch failed: %v", err)
 	} else {
-		if cfg.Auto || forceAuto {
-			if err := autoSelect(cfg, rows); err != nil {
+		pol := cfg.EffectivePolicy()
+		if forceAuto && pol == "manual" {
+			pol = "account" // explicit `ccb auto` keeps its historical account-wide metric
+		}
+		if pol != "manual" {
+			if err := autoSelect(cfg, rows, pol); err != nil {
 				logf("auto-select: %v", err)
 			}
 		}
@@ -145,17 +235,27 @@ func syncCycle(cfg *config.Agent, client *http.Client, forceAuto bool) int {
 	return syncAll(cfg, client, rows)
 }
 
+// usageMetric is the utilization score a rotation policy compares against
+// AutoThreshold: the "all" policy includes model-scoped weekly buckets, every
+// other policy looks at the account-wide 5h/7d windows only. A nil Usage
+// (missing data or a fetch error) scores 0.
+func usageMetric(u *anthropic.Usage, policy string) float64 {
+	if u == nil {
+		return 0
+	}
+	if policy == "all" {
+		return u.MaxUtilizationAll()
+	}
+	return u.MaxUtilization()
+}
+
 // autoSelect keeps the current active account while it is alive and under
 // AutoThreshold; otherwise it switches to the least-utilized eligible one.
-func autoSelect(cfg *config.Agent, rows []usageRow) error {
+// policy selects the utilization metric (see usageMetric).
+func autoSelect(cfg *config.Agent, rows []usageRow, policy string) error {
 	now := time.Now().UnixMilli()
 	eligible := func(r usageRow) bool { return !r.Dead && r.ExpiresAt > now }
-	score := func(r usageRow) float64 {
-		if r.Usage == nil {
-			return 0
-		}
-		return r.Usage.MaxUtilization()
-	}
+	score := func(r usageRow) float64 { return usageMetric(r.Usage, policy) }
 
 	active := readActive(cfg)
 	for _, r := range rows {
@@ -467,6 +567,11 @@ func printStatusline(cfg *config.Agent) {
 		fmt.Println(active)
 		return
 	}
+	// "manual" has no rotation metric of its own; show the account-wide warning.
+	displayPolicy := cfg.EffectivePolicy()
+	if displayPolicy == "manual" {
+		displayPolicy = "account"
+	}
 	for _, r := range cache.Credentials {
 		if r.Name != active {
 			continue
@@ -479,7 +584,7 @@ func printStatusline(cfg *config.Agent) {
 			if r.Usage.SevenDay != nil {
 				line += fmt.Sprintf(" 7d:%.0f%%", r.Usage.SevenDay.Utilization*100)
 			}
-			if r.Usage.MaxUtilization() >= cfg.AutoThreshold {
+			if usageMetric(r.Usage, displayPolicy) >= cfg.AutoThreshold {
 				line = "⚠ " + line
 			}
 		}

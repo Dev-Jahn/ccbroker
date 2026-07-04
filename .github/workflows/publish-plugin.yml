@@ -141,7 +141,7 @@ jobs:
           SOURCE_SHA=$(git -C ../source rev-parse --short HEAD)
           SOURCE_SUBJECT=$(git -C ../source log -1 --pretty=format:'%s')
           git add .
-          printf 'release v%s\n\nSource: Dev-Jahn/cc-cred-broker@%s\nUpstream subject: %s\n\nAutomated release via publish-plugin.yml.\n' \
+          printf 'release v%s\n\nSource: Dev-Jahn/ccbroker@%s\nUpstream subject: %s\n\nAutomated release via publish-plugin.yml.\n' \
             "${VERSION}" "${SOURCE_SHA}" "${SOURCE_SUBJECT}" \
             | git commit -F -
 

@@ -18,9 +18,9 @@ type Client struct {
 
 // Server is the daemon configuration.
 type Server struct {
-	Listen         string   `json:"listen"`         // credential API, e.g. ":8787"
-	AdminListen    string   `json:"adminListen"`    // admin API, e.g. "127.0.0.1:8788"
-	AdminToken     string   `json:"adminToken"`     // bearer for the admin API
+	Listen         string   `json:"listen"`      // credential API, e.g. ":8787"
+	AdminListen    string   `json:"adminListen"` // admin API, e.g. "127.0.0.1:8788"
+	AdminToken     string   `json:"adminToken"`  // bearer for the admin API
 	StorePath      string   `json:"storePath"`
 	KeyPath        string   `json:"keyPath"` // 32-byte master key, hex-encoded
 	AuditLog       string   `json:"auditLog"`
@@ -83,6 +83,23 @@ type Agent struct {
 	// one whenever the current account reaches AutoThreshold.
 	Auto          bool    `json:"auto,omitempty"`
 	AutoThreshold float64 `json:"autoThreshold,omitempty"` // default 0.95
+	// AutoPolicy selects which quota windows drive auto-rotation:
+	//   "manual"  — pull/run never rotate (ccb auto still rotates, account metric)
+	//   "account" — rotate when max(5h, 7d) reaches AutoThreshold
+	//   "all"     — additionally rotate when any model-scoped weekly bucket reaches it
+	// Empty falls back to the legacy Auto bool (true→account, false→manual).
+	AutoPolicy string `json:"autoPolicy,omitempty"`
+}
+
+// EffectivePolicy resolves AutoPolicy, falling back to the legacy Auto bool.
+func (a *Agent) EffectivePolicy() string {
+	if a.AutoPolicy != "" {
+		return a.AutoPolicy
+	}
+	if a.Auto {
+		return "account"
+	}
+	return "manual"
 }
 
 // LoadAgent reads and validates an agent config file.
@@ -97,6 +114,11 @@ func LoadAgent(path string) (*Agent, error) {
 	}
 	if c.BrokerURL == "" || c.Token == "" {
 		return nil, fmt.Errorf("brokerUrl and token are required")
+	}
+	switch c.AutoPolicy {
+	case "", "manual", "account", "all":
+	default:
+		return nil, fmt.Errorf("autoPolicy must be manual, account or all (got %q)", c.AutoPolicy)
 	}
 	if c.IntervalSec == 0 {
 		c.IntervalSec = 1800

@@ -1,12 +1,12 @@
 {
-  "brokerUrl": "https://cc-cred.example.com",
+  "brokerUrl": "https://ccbroker.example.com",
   "token": "REPLACE_WITH_THIS_MACHINE_CLIENT_TOKEN",
   "intervalSec": 1800,
   "caCertPath": "",
   "clientCertPath": "~/.config/ccbroker/pki/this-machine.crt",
   "clientKeyPath": "~/.config/ccbroker/pki/this-machine.key",
   "activeFile": "~/.config/ccbroker/active",
-  "auto": false,
+  "autoPolicy": "manual",
   "autoThreshold": 0.95,
   "targets": [
     { "cred": "@active", "type": "file", "path": "~/.claude/.credentials.json" }

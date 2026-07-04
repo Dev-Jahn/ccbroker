@@ -12,6 +12,4 @@ seed*.json
 /dist/
 *.tgz
 /ccbrokerd
-/ccbroker-agent
-ccbroker-agent.darwin-*
-ccbroker-agent.linux-*
+/ccb

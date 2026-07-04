@@ -18,10 +18,10 @@ import (
 	"sync"
 	"time"
 
-	"ccbroker/internal/anthropic"
-	"ccbroker/internal/config"
-	"ccbroker/internal/creds"
-	"ccbroker/internal/store"
+	"github.com/Dev-Jahn/ccbroker/internal/anthropic"
+	"github.com/Dev-Jahn/ccbroker/internal/config"
+	"github.com/Dev-Jahn/ccbroker/internal/creds"
+	"github.com/Dev-Jahn/ccbroker/internal/store"
 )
 
 const transientBackoff = 60 * time.Second

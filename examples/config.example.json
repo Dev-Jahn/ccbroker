@@ -6,6 +6,7 @@
   "keyPath": "/etc/ccbroker/master.key",
   "auditLog": "/var/log/ccbroker/audit.log",
   "refreshSkewSec": 600,
+  "usagePollSec": 300,
   "clients": [
     {
       "name": "my-laptop",

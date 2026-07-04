@@ -10,7 +10,9 @@
 //	ccb auto        [-c agent.json]   # switch to the least-utilized account and sync
 //	ccb status      [-c agent.json]   # quota table for all accounts in scope
 //	ccb statusline  [-c agent.json]   # one-line summary from cache (for Claude Code statusLine)
-//	ccb statusline --install [--settings <path>]  # register as Claude Code statusLine
+//	ccb statusline --all [-c agent.json]          # full per-account usage line
+//	ccb statusline on|off [--settings <path>]     # install/remove the Claude Code statusLine
+//	ccb statusline --install [--settings <path>]  # register as Claude Code statusLine (legacy)
 //	ccb policy [manual|account|all] [-c agent.json]  # show or set the auto-rotation policy
 //	ccb setup       [-c agent.json]   # interactive first-run wizard
 //	ccb version                       # print the ccb version
@@ -23,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -32,6 +35,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Dev-Jahn/ccbroker/internal/anthropic"
 	"github.com/Dev-Jahn/ccbroker/internal/config"
@@ -51,6 +55,7 @@ func main() {
 	cfgPath := defaultConfigPath()
 	settingsPath := ""
 	install := false
+	all := false
 	var positional []string
 	args := os.Args[2:]
 	for i := 0; i < len(args); i++ {
@@ -60,6 +65,8 @@ func main() {
 			i++
 		case args[i] == "--install":
 			install = true
+		case args[i] == "--all":
+			all = true
 		case args[i] == "--settings" && i+1 < len(args):
 			settingsPath = args[i+1]
 			i++
@@ -68,11 +75,30 @@ func main() {
 		}
 	}
 
-	if cmd == "statusline" && install {
-		if err := installStatusline(settingsPath); err != nil {
-			fatal(err)
+	// on/off and --install edit settings.json (or a statusline script) directly
+	// and need no agent.json, so they run before LoadAgent like the legacy path.
+	if cmd == "statusline" {
+		sub := ""
+		if len(positional) > 0 {
+			sub = positional[0]
 		}
-		return
+		switch {
+		case install:
+			if err := installStatusline(settingsPath); err != nil {
+				fatal(err)
+			}
+			return
+		case sub == "on":
+			if err := statuslineOn(settingsPath); err != nil {
+				fatal(err)
+			}
+			return
+		case sub == "off":
+			if err := statuslineOff(settingsPath); err != nil {
+				fatal(err)
+			}
+			return
+		}
 	}
 
 	// These run before LoadAgent: version needs no config, and setup/policy
@@ -99,7 +125,11 @@ func main() {
 	}
 
 	if cmd == "statusline" {
-		printStatusline(cfg)
+		if all {
+			printStatuslineAll(cfg)
+		} else {
+			printStatusline(cfg)
+		}
 		return
 	}
 
@@ -600,6 +630,114 @@ func printStatusline(cfg *config.Agent) {
 	fmt.Println(active)
 }
 
+// ---- statusline --all (full multi-account line, no network) ----
+
+// ANSI codes for the --all line. Foreground colors are 256-color (38;5;N).
+const (
+	slRST  = "\x1b[0m"
+	slSEP  = "\x1b[38;5;240m │ \x1b[0m" // dim separator with its surrounding spaces
+	slACT  = "\x1b[1;38;5;117m"         // active account name (bold bright blue)
+	slDIM  = "\x1b[38;5;245m"           // inactive names and segment labels
+	slHIGH = "\x1b[38;5;210m"           // utilization >= 80% (and the dead ✗)
+	slMID  = "\x1b[38;5;221m"           // utilization >= 50%
+	slLOW  = "\x1b[38;5;114m"           // utilization < 50%
+)
+
+// printStatuslineAll renders the full multi-account usage line (see
+// renderStatuslineAll) from the cache. Like printStatusline, a missing or
+// unparsable cache falls back to the plain active name.
+func printStatuslineAll(cfg *config.Agent) {
+	active := readActive(cfg)
+	b, err := os.ReadFile(statusCachePath(cfg))
+	if err != nil {
+		fmt.Println(active)
+		return
+	}
+	var cache statusCache
+	if err := json.Unmarshal(b, &cache); err != nil {
+		fmt.Println(active)
+		return
+	}
+	fmt.Println(renderStatuslineAll(active, cache, time.Now().UnixMilli()))
+}
+
+// renderStatuslineAll builds the full one-line status from a cache snapshot:
+// every credential in cache order joined by SEP, the active one marked ⛁ and
+// bright, dead ones prefixed ✗, each followed by 5h/7d and per-model weekly
+// utilization segments. Pure (no I/O) so it is testable; nowMs drives the
+// " ~stale" suffix.
+func renderStatuslineAll(active string, cache statusCache, nowMs int64) string {
+	parts := make([]string, 0, len(cache.Credentials))
+	for _, r := range cache.Credentials {
+		var b strings.Builder
+		if r.Dead {
+			b.WriteString(slHIGH + "✗ " + slRST)
+		}
+		if r.Name == active {
+			b.WriteString(slACT + "⛁ " + r.Name + slRST)
+		} else {
+			b.WriteString(slDIM + r.Name + slRST)
+		}
+		for _, seg := range statuslineSegments(r.Usage) {
+			b.WriteString(" " + seg)
+		}
+		parts = append(parts, b.String())
+	}
+	line := strings.Join(parts, slSEP)
+	if nowMs-cache.FetchedAt > 90*60*1000 {
+		line += slDIM + " ~stale" + slRST
+	}
+	return line
+}
+
+// statuslineSegments renders the "5h:", "7d:" and per-model weekly segments for
+// one credential, in that order; weekly buckets are sorted by model display
+// name. A nil Usage yields no segments.
+func statuslineSegments(u *anthropic.Usage) []string {
+	if u == nil {
+		return nil
+	}
+	var segs []string
+	if u.FiveHour != nil {
+		segs = append(segs, statuslineSegment("5h:", u.FiveHour.Utilization))
+	}
+	if u.SevenDay != nil {
+		segs = append(segs, statuslineSegment("7d:", u.SevenDay.Utilization))
+	}
+	models := make([]string, 0, len(u.ScopedWeekly))
+	for m := range u.ScopedWeekly {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+	for _, m := range models {
+		segs = append(segs, statuslineSegment(modelLabel(m), u.ScopedWeekly[m].Utilization))
+	}
+	return segs
+}
+
+// statuslineSegment formats one "<label><pct>%" segment: label in DIM, the
+// percentage colored by utilization (>=80 HIGH, >=50 MID, else LOW).
+func statuslineSegment(label string, util float64) string {
+	p := int(math.Round(util * 100))
+	color := slLOW
+	switch {
+	case p >= 80:
+		color = slHIGH
+	case p >= 50:
+		color = slMID
+	}
+	return slDIM + label + color + fmt.Sprintf("%d%%", p) + slRST
+}
+
+// modelLabel abbreviates a model display name to its first rune uppercased plus
+// ":" (e.g. "Fable" → "F:").
+func modelLabel(model string) string {
+	for _, r := range model {
+		return string(unicode.ToUpper(r)) + ":"
+	}
+	return ":"
+}
+
 // installStatusline registers `ccb statusline` as the Claude Code statusLine
 // command in settings.json (default ~/.claude/settings.json), preserving all
 // other settings.
@@ -640,6 +778,293 @@ func installStatusline(settingsPath string) error {
 	return nil
 }
 
+// ---- statusline on|off (idempotent install/remove) ----
+
+// The marker block wraps the ccbroker line inside an existing statusline script
+// so `off` can find and remove exactly what `on` added. Bytes are exact.
+const (
+	markerBegin = "# >>> ccbroker statusline >>>"
+	markerBody  = "command -v ccb >/dev/null 2>&1 && ccb statusline --all"
+	markerEnd   = "# <<< ccbroker statusline <<<"
+)
+
+// statuslineBlock is the marker block with a trailing newline.
+func statuslineBlock() string {
+	return markerBegin + "\n" + markerBody + "\n" + markerEnd + "\n"
+}
+
+// settingsPathOrDefault resolves the settings path, defaulting to the standard
+// Claude Code location. A symlinked settings.json is resolved to its target so
+// an atomic write updates the real file instead of replacing the symlink (which
+// would break dotfile managers like stow/chezmoi).
+func settingsPathOrDefault(settingsPath string) string {
+	if settingsPath == "" {
+		settingsPath = "~/.claude/settings.json"
+	}
+	return resolveSymlink(expandHome(settingsPath))
+}
+
+// loadSettings reads settings.json into a map, decoding with UseNumber so large
+// integers round-trip exactly. A missing file yields an empty map; invalid JSON
+// is an error (the file is left untouched).
+func loadSettings(p string) (map[string]any, error) {
+	m := map[string]any{}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return m, nil
+		}
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
+		return nil, fmt.Errorf("%s is not valid JSON, not touching it: %w", p, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("%s is not valid JSON, not touching it: trailing data after the top-level object", p)
+	}
+	return m, nil
+}
+
+// writeSettings atomically writes m to p as pretty JSON with 0644 perms
+// (settings.json is not a secret).
+func writeSettings(p string, m map[string]any) error {
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileMode(p, append(b, '\n'), 0o644)
+}
+
+// statuslineInterp holds interpreter tokens skipped when locating the program or
+// script inside a statusLine command string.
+var statuslineInterp = map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": true, "env": true}
+
+// isInterpToken reports whether tok names an interpreter, by bare name or by
+// absolute path (basename), so leading interpreter tokens can be skipped.
+func isInterpToken(tok string) bool {
+	return statuslineInterp[tok] || statuslineInterp[filepath.Base(tok)]
+}
+
+// isCcbStatuslineCommand reports whether a statusLine command string is a ccb
+// statusline invocation (ours to manage). A substring match on this binary's
+// resolved absolute path is unambiguous; otherwise `ccb` must be the actual
+// program invoked (after skipping interpreter tokens) followed by the statusline
+// subcommand — not merely a substring of a larger word (e.g. "myccb") or
+// embedded inside a composite command — so `on`/`off` never rewrite or delete a
+// foreign or wrapper statusLine.
+func isCcbStatuslineCommand(cmd, exe string) bool {
+	if strings.Contains(cmd, exe+" statusline") {
+		return true
+	}
+	fields := strings.Fields(cmd)
+	i := 0
+	for i < len(fields) && isInterpToken(fields[i]) {
+		i++
+	}
+	return i+1 < len(fields) && filepath.Base(fields[i]) == "ccb" && fields[i+1] == "statusline"
+}
+
+// locateScript finds the statusline script inside a command string: it skips
+// leading interpreter tokens (bash/sh/zsh/dash/env, by name or absolute path)
+// and returns the first remaining token that ~-expands to an existing regular
+// file. Returns "" if none is found.
+//
+// The command is split on whitespace and does not honor shell quoting, so a
+// script whose path contains spaces (e.g. bash "/Users/me/My Scripts/x.sh") is
+// not located; such a script must be integrated with the marker block manually.
+func locateScript(cmd string) string {
+	skipping := true
+	for _, tok := range strings.Fields(cmd) {
+		if skipping && isInterpToken(tok) {
+			continue
+		}
+		skipping = false
+		p := expandHome(tok)
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+			return p
+		}
+	}
+	return ""
+}
+
+// blockBounds locates the marker block in content, returning the byte range
+// [start, end) covering the block including its trailing newline.
+func blockBounds(content string) (start, end int, ok bool) {
+	bi := strings.Index(content, markerBegin)
+	if bi < 0 {
+		return 0, 0, false
+	}
+	mi := strings.Index(content[bi:], markerEnd)
+	if mi < 0 {
+		return 0, 0, false
+	}
+	end = bi + mi + len(markerEnd)
+	if end < len(content) && content[end] == '\n' {
+		end++
+	}
+	return bi, end, true
+}
+
+// blockUpsert returns content with the marker block present: it replaces an
+// existing block in place (so re-running is byte-identical) or appends
+// "\n" + block at EOF.
+func blockUpsert(content string) string {
+	block := statuslineBlock()
+	if s, e, ok := blockBounds(content); ok {
+		return content[:s] + block + content[e:]
+	}
+	return content + "\n" + block
+}
+
+// blockRemove returns content with the marker block removed; ok is false if no
+// block was present. The single newline blockUpsert inserts before an appended
+// block is stripped only when the block was at EOF (the shape `on` produces), so
+// any content following the block keeps its line separator instead of being
+// glued onto the preceding line.
+func blockRemove(content string) (string, bool) {
+	s, e, ok := blockBounds(content)
+	if !ok {
+		return content, false
+	}
+	pre, post := content[:s], content[e:]
+	if post == "" {
+		pre = strings.TrimSuffix(pre, "\n")
+	}
+	return pre + post, true
+}
+
+// statuslineOn installs (or idempotently updates) the ccbroker `statusline
+// --all` line. With no existing statusLine it sets one; if the existing
+// statusLine is a ccb command it normalizes it; if it is an existing statusline
+// script it edits in the marker block; otherwise it errors with the block to
+// paste manually.
+func statuslineOn(settingsPath string) error {
+	p := settingsPathOrDefault(settingsPath)
+	m, err := loadSettings(p)
+	if err != nil {
+		return err
+	}
+	exe, err := resolveExe()
+	if err != nil {
+		return err
+	}
+	target := exe + " statusline --all"
+
+	v, exists := m["statusLine"]
+	if !exists {
+		m["statusLine"] = map[string]any{"type": "command", "command": target}
+		if err := writeSettings(p, m); err != nil {
+			return err
+		}
+		fmt.Printf("statusLine installed in %s -> %s\n", p, target)
+		return nil
+	}
+
+	sl, _ := v.(map[string]any)
+	cmd := ""
+	if sl != nil {
+		cmd, _ = sl["command"].(string)
+	}
+
+	if isCcbStatuslineCommand(cmd, exe) {
+		if cmd == target {
+			fmt.Printf("statusLine already set in %s -> %s\n", p, target)
+			return nil
+		}
+		sl["command"] = target
+		if _, ok := sl["type"]; !ok {
+			sl["type"] = "command"
+		}
+		if err := writeSettings(p, m); err != nil {
+			return err
+		}
+		fmt.Printf("statusLine updated in %s -> %s\n", p, target)
+		return nil
+	}
+
+	if script := locateScript(cmd); script != "" {
+		script = resolveSymlink(script)
+		fi, err := os.Stat(script)
+		if err != nil {
+			return err
+		}
+		old, err := os.ReadFile(script)
+		if err != nil {
+			return err
+		}
+		updated := blockUpsert(string(old))
+		if updated == string(old) {
+			fmt.Printf("ccbroker statusline block already present in %s\n", script)
+			return nil
+		}
+		if err := writeFileMode(script, []byte(updated), fi.Mode().Perm()); err != nil {
+			return err
+		}
+		fmt.Printf("ccbroker statusline block added to %s\n", script)
+		return nil
+	}
+
+	return fmt.Errorf("%s has a statusLine command (%q) that is neither a ccb command nor a locatable script; add this block to your statusline script manually:\n\n%s", p, cmd, statuslineBlock())
+}
+
+// statuslineOff removes what statuslineOn added: a ccb statusLine command is
+// deleted from settings.json; a marker block is removed from the referenced
+// script (perms preserved); anything else is a no-op.
+func statuslineOff(settingsPath string) error {
+	p := settingsPathOrDefault(settingsPath)
+	m, err := loadSettings(p)
+	if err != nil {
+		return err
+	}
+	v, exists := m["statusLine"]
+	if !exists {
+		fmt.Println("statusLine: nothing to remove")
+		return nil
+	}
+	sl, _ := v.(map[string]any)
+	cmd := ""
+	if sl != nil {
+		cmd, _ = sl["command"].(string)
+	}
+	exe, err := resolveExe()
+	if err != nil {
+		return err
+	}
+
+	if isCcbStatuslineCommand(cmd, exe) {
+		delete(m, "statusLine")
+		if err := writeSettings(p, m); err != nil {
+			return err
+		}
+		fmt.Printf("statusLine removed from %s\n", p)
+		return nil
+	}
+
+	if script := locateScript(cmd); script != "" {
+		script = resolveSymlink(script)
+		fi, err := os.Stat(script)
+		if err != nil {
+			return err
+		}
+		b, err := os.ReadFile(script)
+		if err != nil {
+			return err
+		}
+		if updated, removed := blockRemove(string(b)); removed {
+			if err := writeFileMode(script, []byte(updated), fi.Mode().Perm()); err != nil {
+				return err
+			}
+			fmt.Printf("ccbroker statusline block removed from %s\n", script)
+			return nil
+		}
+	}
+
+	fmt.Println("statusLine: nothing to remove")
+	return nil
+}
+
 // ---- target writers ----
 
 func writeTarget(t config.Target, body []byte) error {
@@ -655,6 +1080,26 @@ func writeTarget(t config.Target, body []byte) error {
 
 // writeFile atomically writes body to path with 0600 perms.
 func writeFile(path string, body []byte) error {
+	return writeFileMode(path, body, 0o600)
+}
+
+// resolveSymlink returns the real path a symlink points at (following the whole
+// chain) so a caller's atomic rename writes through to the target rather than
+// replacing the link itself. Non-symlinks and missing paths are returned
+// unchanged.
+func resolveSymlink(path string) string {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if real, err := filepath.EvalSymlinks(path); err == nil {
+			return real
+		}
+	}
+	return path
+}
+
+// writeFileMode atomically writes body to path with perm: it writes a temp file
+// in the same directory, chmods it, and renames over path so readers never see
+// a partial file. writeFile is the 0600 shorthand.
+func writeFileMode(path string, body []byte, perm os.FileMode) error {
 	if path == "" {
 		return fmt.Errorf("file target requires a path")
 	}
@@ -668,7 +1113,7 @@ func writeFile(path string, body []byte) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0o600); err != nil {
+	if err := tmp.Chmod(perm); err != nil {
 		tmp.Close()
 		return err
 	}

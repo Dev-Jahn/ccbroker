@@ -217,15 +217,39 @@ or run `/ccb-policy` in the Claude Code plugin, or edit `autoPolicy` in
 
 ## Claude Code statusline
 
-`ccb statusline` prints a one-line summary of the active account from the
+`ccb statusline` prints a one-line summary of the **active** account from the
 cached snapshot (no network in the hot path):
 
 ```
 personal 5h:16% 7d:62%
 ```
 
-Install it as your Claude Code statusline (refuses to overwrite an existing
-statusLine — in that case call `ccb statusline` from your own script):
+`ccb statusline --all` renders **every** account your token can read on one
+line — 5h / 7d and each per-model weekly bucket, the active account marked `⛁`,
+dead accounts marked `✗`, each utilization colored by how full it is and the
+whole line suffixed ` ~stale` when the cache is old (shown here without ANSI
+color):
+
+```
+personal 5h:12% 7d:40% F:71% │ ⛁ work 5h:3% 7d:22% F:9%
+```
+
+Turn that full line on or off as your Claude Code statusline. Both are
+idempotent — running either twice leaves the file byte-for-byte unchanged:
+
+```sh
+ccb statusline on                                   # ~/.claude/settings.json
+ccb statusline on  --settings ~/.claude-work/settings.json
+ccb statusline off                                  # remove it again
+```
+
+`on` writes `ccb statusline --all` as the statusLine of a settings file that
+has none yet; if a statusLine already exists it instead appends a ccbroker
+marker block to the statusline script that command points at (preserving the
+script's mode), leaving your own statusline intact. `off` removes exactly
+whatever `on` added. The legacy `ccb statusline --install` still works — it
+writes the statusLine into `~/.claude/settings.json` and refuses to overwrite
+an existing one:
 
 ```sh
 ccb statusline --install               # writes statusLine into ~/.claude/settings.json
@@ -235,10 +259,12 @@ ccb statusline --install --settings ~/.claude-work/settings.json
 ## Claude Code plugin
 
 `claude-plugin/` is a minimal Claude Code plugin exposing `/ccb-status`,
-`/ccb-use <name>`, `/ccb-auto` and `/ccb-policy [manual|account|all]` as slash
-commands plus a SessionStart hook that runs `ccb pull` (fresh token + fresh
-quota cache at session start). It requires `ccb` on PATH. Statuslines are not a
-plugin surface in Claude Code — use `ccb statusline --install` for that.
+`/ccb-use <name>`, `/ccb-auto`, `/ccb-policy [manual|account|all]` and
+`/ccbroker:statusline [on|off]` as slash commands plus a SessionStart hook that
+runs `ccb pull` (fresh token + fresh quota cache at session start). It requires
+`ccb` on PATH. Claude Code does not render statuslines from a plugin, so
+`/ccbroker:statusline` just shells out to `ccb statusline on|off` to wire the
+line into your `settings.json`.
 
 Install it from the marketplace:
 

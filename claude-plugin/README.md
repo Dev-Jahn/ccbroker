@@ -16,6 +16,8 @@ work.
 - `/ccb-auto` — keep the active account while it is under the threshold, else
   switch to the least-utilized live account per the configured rotation policy.
 - `/ccb-policy [manual|account|all]` — show or set the auto-rotation policy.
+- `/ccbroker:statusline [on|off]` — render the multi-account usage line, and
+  turn it on or off in your Claude Code statusline.
 
 ## SessionStart hook
 

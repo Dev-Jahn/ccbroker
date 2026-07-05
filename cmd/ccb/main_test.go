@@ -142,15 +142,17 @@ func TestRenderStatuslineAll(t *testing.T) {
 		FetchedAt: nowMs - 2*60*60*1000, // 2h ago → stale (>90min)
 		Credentials: []usageRow{
 			{Name: "alpha", Usage: &anthropic.Usage{
-				FiveHour: &anthropic.Bucket{Utilization: 0.12}, // 12% → LOW
-				SevenDay: &anthropic.Bucket{Utilization: 0.71}, // 71% → MID
+				// FiveHour resets 2h35m ahead → "↻2h35m".
+				FiveHour: &anthropic.Bucket{Utilization: 0.12, ResetsAt: nowMs + 9_300_000}, // 12% → LOW
+				SevenDay: &anthropic.Bucket{Utilization: 0.71},                              // 71% → MID
 				ScopedWeekly: map[string]anthropic.Bucket{
 					"Fable":  {Utilization: 1.37}, // 137% overage → HIGH
 					"Sonnet": {Utilization: 0.05}, // 5% → LOW
 				},
 			}},
 			{Name: "bravo", Usage: &anthropic.Usage{
-				FiveHour: &anthropic.Bucket{Utilization: 0.50}, // 50% → MID
+				// FiveHour reset already past → no ↻.
+				FiveHour: &anthropic.Bucket{Utilization: 0.50, ResetsAt: nowMs - 60_000}, // 50% → MID
 			}},
 			{Name: "charlie", Dead: true},
 		},
@@ -199,6 +201,14 @@ func TestRenderStatuslineAll(t *testing.T) {
 	if n := strings.Count(line, slSEP); n != 2 {
 		t.Errorf("separator count=%d want 2:\n%q", n, line)
 	}
+	// Reset countdown: only alpha's future FiveHour reset gets ↻; bravo's is
+	// in the past and charlie has no usage, so exactly one ↻ appears.
+	if n := strings.Count(line, "↻"); n != 1 {
+		t.Errorf("↻ count=%d want 1:\n%q", n, line)
+	}
+	if !strings.Contains(line, slREM+"↻2h35m"+slRST) {
+		t.Errorf("alpha reset countdown ↻2h35m missing:\n%q", line)
+	}
 	// Stale suffix (fetched 2h ago).
 	if !strings.Contains(line, "~stale") {
 		t.Errorf("~stale suffix missing:\n%q", line)
@@ -208,6 +218,23 @@ func TestRenderStatuslineAll(t *testing.T) {
 	fresh := statusCache{FetchedAt: nowMs, Credentials: cache.Credentials}
 	if strings.Contains(renderStatuslineAll("bravo", fresh, nowMs), "~stale") {
 		t.Errorf("fresh cache should not be marked ~stale")
+	}
+}
+
+func TestFmtRemain(t *testing.T) {
+	cases := []struct {
+		sec  int64
+		want string
+	}{
+		{95 * 60, "1h35m"},         // 95 min
+		{3*86400 + 2*3600, "3d2h"}, // 3d2h exactly
+		{45, "0m"},                 // under a minute floors to 0m
+		{26 * 3600, "1d2h"},        // 26h rolls into 1d2h
+	}
+	for _, c := range cases {
+		if got := fmtRemain(c.sec); got != c.want {
+			t.Errorf("fmtRemain(%d)=%q want %q", c.sec, got, c.want)
+		}
 	}
 }
 

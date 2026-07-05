@@ -7,6 +7,8 @@ Run `ccb use $ARGUMENTS` with the Bash tool.
 
 - On success, confirm which account is now active and remind the user that the
   switch applies to NEW Claude Code sessions — the current session keeps its
-  in-memory token until it ends.
+  in-memory token until it expires (within ~8h), when it may briefly show
+  "Not logged in" before automatically adopting the newly active account on
+  resume (no `/login` needed).
 - If no argument was given, run `ccb status` first and ask which account to
   switch to.

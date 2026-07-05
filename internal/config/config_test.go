@@ -31,6 +31,22 @@ func TestLoadAgentValidAutoPolicy(t *testing.T) {
 	}
 }
 
+func TestLoadServerDefaultRefreshSkew(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "server.json")
+	// refreshSkewSec absent → must default to 3600 (comfortably above the
+	// default 1800s agent pull interval so rotated tokens land while valid).
+	if err := os.WriteFile(p, []byte(`{"storePath":"/x/store.json","keyPath":"/x/key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadServer(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RefreshSkewSec != 3600 {
+		t.Errorf("RefreshSkewSec default = %d, want 3600", c.RefreshSkewSec)
+	}
+}
+
 func TestEffectivePolicy(t *testing.T) {
 	cases := []struct {
 		policy string

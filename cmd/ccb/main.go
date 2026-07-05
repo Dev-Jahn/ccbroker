@@ -641,6 +641,7 @@ const (
 	slHIGH = "\x1b[38;5;210m"           // utilization >= 80% (and the dead ✗)
 	slMID  = "\x1b[38;5;221m"           // utilization >= 50%
 	slLOW  = "\x1b[38;5;114m"           // utilization < 50%
+	slREM  = "\x1b[38;5;244m"           // 5h reset countdown (↻)
 )
 
 // printStatuslineAll renders the full multi-account usage line (see
@@ -680,6 +681,12 @@ func renderStatuslineAll(active string, cache statusCache, nowMs int64) string {
 		}
 		for _, seg := range statuslineSegments(r.Usage) {
 			b.WriteString(" " + seg)
+		}
+		// Only the five-hour window gets a reset countdown: it is the
+		// short-cycle constraint, whereas 7d/model-weekly resets are already
+		// legible from how far their percentages have climbed.
+		if r.Usage != nil && r.Usage.FiveHour != nil && r.Usage.FiveHour.ResetsAt > nowMs {
+			b.WriteString(" " + slREM + "↻" + fmtRemain((r.Usage.FiveHour.ResetsAt-nowMs)/1000) + slRST)
 		}
 		parts = append(parts, b.String())
 	}
@@ -727,6 +734,23 @@ func statuslineSegment(label string, util float64) string {
 		color = slMID
 	}
 	return slDIM + label + color + fmt.Sprintf("%d%%", p) + slRST
+}
+
+// fmtRemain renders a seconds duration as a compact reset countdown: "XdYh"
+// when there are whole days left, "XhYm" when there are whole hours, else "Xm"
+// (all components floored, so under a minute prints "0m").
+func fmtRemain(sec int64) string {
+	d := sec / 86400
+	h := (sec % 86400) / 3600
+	m := (sec % 3600) / 60
+	switch {
+	case d > 0:
+		return fmt.Sprintf("%dd%dh", d, h)
+	case h > 0:
+		return fmt.Sprintf("%dh%dm", h, m)
+	default:
+		return fmt.Sprintf("%dm", m)
+	}
 }
 
 // modelLabel abbreviates a model display name to its first rune uppercased plus

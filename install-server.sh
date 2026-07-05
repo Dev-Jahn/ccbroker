@@ -93,7 +93,7 @@ cat > /etc/ccbroker/config.json <<EOF
   "storePath": "/var/lib/ccbroker/store.enc",
   "keyPath": "/etc/ccbroker/master.key",
   "auditLog": "/var/log/ccbroker/audit.log",
-  "refreshSkewSec": 600,
+  "refreshSkewSec": 3600,
   "usagePollSec": 300,
   "clients": [
     {"name": "client1", "tokenSha256": "$CLIENT_HASH", "scopes": ["*"]}

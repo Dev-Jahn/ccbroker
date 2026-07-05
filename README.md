@@ -30,7 +30,7 @@ machine read from it. That component is this broker.
                  ┌──────────────────────── broker host (private) ─────────────┐
                  │  ccbrokerd                                                  │
                  │   ├─ encrypted store (AES-256-GCM)   one record per cred    │
-                 │   ├─ refresh manager   single-flight, refresh ~10m early    │
+                 │   ├─ refresh manager   single-flight, refresh ~1h early     │
                  │   │     POST https://api.anthropic.com/v1/oauth/token       │
                  │   ├─ credential API   :8787   Bearer token + per-cred scope │
                  │   └─ admin API        127.0.0.1:8788   X-Admin-Token        │
@@ -176,9 +176,14 @@ ccb use personal   # ~/.claude now authenticates as "personal"
 ccb use work       # ...now as "work"
 ```
 
-The periodic `run` loop keeps whatever is currently active fresh. Running
-Claude Code sessions are unaffected by a switch — they hold their access token
-in memory, and every refresh still happens only on the broker.
+The periodic `run` loop keeps whatever is currently active fresh, and every
+refresh still happens only on the broker. A Claude Code session already running
+under the old account holds that account's token in memory, so it keeps using it
+until the token expires (within ~8h); at that point the session may briefly show
+"Not logged in", and resuming adopts the newly active account from disk
+automatically — no `/login` needed. On machines running autonomous work, prefer
+switching between sessions rather than during one so the switch never interrupts
+a live run.
 
 ## Rotation policies
 
@@ -225,13 +230,13 @@ personal 5h:16% 7d:62%
 ```
 
 `ccb statusline --all` renders **every** account your token can read on one
-line — 5h / 7d and each per-model weekly bucket, the active account marked `⛁`,
-dead accounts marked `✗`, each utilization colored by how full it is and the
-whole line suffixed ` ~stale` when the cache is old (shown here without ANSI
-color):
+line — 5h / 7d and each per-model weekly bucket, a dim `↻` countdown to each
+account's next 5-hour reset, the active account marked `⛁`, dead accounts marked
+`✗`, each utilization colored by how full it is and the whole line suffixed
+` ~stale` when the cache is old (shown here without ANSI color):
 
 ```
-personal 5h:12% 7d:40% F:71% │ ⛁ work 5h:3% 7d:22% F:9%
+personal 5h:12% 7d:40% F:71% ↻2h35m │ ⛁ work 5h:3% 7d:22% F:9% ↻41m
 ```
 
 Turn that full line on or off as your Claude Code statusline. Both are
@@ -352,10 +357,14 @@ from under it); it returns `503` instead so the client keeps its last good copy.
 * **Terms of service.** This uses a subscription OAuth token outside the
   official Claude Code client. Intended for personal, self-hosted use with your
   own account. Understand your provider's terms before using it.
-* **Offline windows.** If a machine cannot reach the broker for longer than the
-  access-token lifetime *and* Claude Code tries to refresh locally, it will
-  rotate the broker's refresh token and cause a conflict. Keep `intervalSec`
-  well under the token lifetime (default 30 min vs ~8 h).
+* **Offline windows.** The broker rotates a credential's refresh token
+  `refreshSkewSec` before its access token expires, so every machine must pull
+  the rotated token while its old access token is still valid. Keep each agent's
+  `intervalSec` (and any cron cadence) well **under** the broker's
+  `refreshSkewSec` (default 1 h; the default pairing is a 30 min pull vs a 1 h
+  skew). A machine that stays offline past that window can fall back to a local
+  refresh, rotating the broker's refresh token out from under it and forcing a
+  re-login.
 * **Master key.** If the key file is lost the store cannot be decrypted; the
   only cost is re-importing credentials (re-login), but back the key up
   somewhere safe.

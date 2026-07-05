@@ -24,7 +24,7 @@ type Server struct {
 	StorePath      string   `json:"storePath"`
 	KeyPath        string   `json:"keyPath"` // 32-byte master key, hex-encoded
 	AuditLog       string   `json:"auditLog"`
-	RefreshSkewSec int64    `json:"refreshSkewSec"` // refresh when within N sec of expiry
+	RefreshSkewSec int64    `json:"refreshSkewSec"` // refresh N sec before expiry; keep well above agents' intervalSec (default 3600)
 	UsagePollSec   int64    `json:"usagePollSec"`   // poll quota usage every N sec
 	Clients        []Client `json:"clients"`
 }
@@ -46,7 +46,7 @@ func LoadServer(path string) (*Server, error) {
 		c.AdminListen = "127.0.0.1:8788"
 	}
 	if c.RefreshSkewSec == 0 {
-		c.RefreshSkewSec = 600
+		c.RefreshSkewSec = 3600
 	}
 	if c.UsagePollSec == 0 {
 		c.UsagePollSec = 300

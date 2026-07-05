@@ -8,8 +8,13 @@ name: Sync plugin to marketplace
 # points straight at THIS repo's claude-plugin/ directory, pinned to an exact
 # commit SHA:
 #
-#   "source": { "source": "git-subdir", "url": "Dev-Jahn/ccbroker",
+#   "source": { "source": "git-subdir", "url": "https://github.com/Dev-Jahn/ccbroker",
 #               "path": "claude-plugin", "sha": "<commit>" }
+#
+# The url is a full https URL on purpose: the "owner/repo" shorthand makes
+# Claude Code clone over ssh (git@github.com), which dies on hosts without a
+# GitHub ssh key or with a non-22 outbound ssh port (e.g. B200-2's cluster-wide
+# `Port 49001` in /etc/ssh/ssh_config). https clones work anonymously anywhere.
 #
 # So there is nothing to publish or tag. Every change to claude-plugin/ on main
 # just needs to MOVE that pin to the new HEAD commit (and copy the plugin's
@@ -69,7 +74,7 @@ jobs:
           jq --arg sha "${GITHUB_SHA}" --arg ver "${VERSION}" '
             .plugins |= map(
               if .name == "ccbroker" then
-                .source = {"source":"git-subdir","url":"Dev-Jahn/ccbroker","path":"claude-plugin","sha":$sha}
+                .source = {"source":"git-subdir","url":"https://github.com/Dev-Jahn/ccbroker","path":"claude-plugin","sha":$sha}
                 | .version = $ver
               else . end
             )

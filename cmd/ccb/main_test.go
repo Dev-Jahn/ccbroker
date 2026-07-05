@@ -142,17 +142,17 @@ func TestRenderStatuslineAll(t *testing.T) {
 		FetchedAt: nowMs - 2*60*60*1000, // 2h ago → stale (>90min)
 		Credentials: []usageRow{
 			{Name: "alpha", Usage: &anthropic.Usage{
-				// FiveHour resets 2h35m ahead → "↻2h35m".
-				FiveHour: &anthropic.Bucket{Utilization: 0.12, ResetsAt: nowMs + 9_300_000}, // 12% → LOW
-				SevenDay: &anthropic.Bucket{Utilization: 0.71},                              // 71% → MID
+				FiveHour: &anthropic.Bucket{Utilization: 0.12}, // 12% → LOW
+				// SevenDay resets 2h35m ahead → "↻2h35m".
+				SevenDay: &anthropic.Bucket{Utilization: 0.71, ResetsAt: nowMs + 9_300_000}, // 71% → MID
 				ScopedWeekly: map[string]anthropic.Bucket{
 					"Fable":  {Utilization: 1.37}, // 137% overage → HIGH
 					"Sonnet": {Utilization: 0.05}, // 5% → LOW
 				},
 			}},
 			{Name: "bravo", Usage: &anthropic.Usage{
-				// FiveHour reset already past → no ↻.
-				FiveHour: &anthropic.Bucket{Utilization: 0.50, ResetsAt: nowMs - 60_000}, // 50% → MID
+				// SevenDay reset already past → no ↻.
+				SevenDay: &anthropic.Bucket{Utilization: 0.50, ResetsAt: nowMs - 60_000}, // 50% → MID
 			}},
 			{Name: "charlie", Dead: true},
 		},
@@ -201,7 +201,7 @@ func TestRenderStatuslineAll(t *testing.T) {
 	if n := strings.Count(line, slSEP); n != 2 {
 		t.Errorf("separator count=%d want 2:\n%q", n, line)
 	}
-	// Reset countdown: only alpha's future FiveHour reset gets ↻; bravo's is
+	// Reset countdown: only alpha's future SevenDay reset gets ↻; bravo's is
 	// in the past and charlie has no usage, so exactly one ↻ appears.
 	if n := strings.Count(line, "↻"); n != 1 {
 		t.Errorf("↻ count=%d want 1:\n%q", n, line)

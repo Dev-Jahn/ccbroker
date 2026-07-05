@@ -641,7 +641,7 @@ const (
 	slHIGH = "\x1b[38;5;210m"           // utilization >= 80% (and the dead ✗)
 	slMID  = "\x1b[38;5;221m"           // utilization >= 50%
 	slLOW  = "\x1b[38;5;114m"           // utilization < 50%
-	slREM  = "\x1b[38;5;244m"           // 5h reset countdown (↻)
+	slREM  = "\x1b[38;5;244m"           // 7d reset countdown (↻)
 )
 
 // printStatuslineAll renders the full multi-account usage line (see
@@ -682,11 +682,11 @@ func renderStatuslineAll(active string, cache statusCache, nowMs int64) string {
 		for _, seg := range statuslineSegments(r.Usage) {
 			b.WriteString(" " + seg)
 		}
-		// Only the five-hour window gets a reset countdown: it is the
-		// short-cycle constraint, whereas 7d/model-weekly resets are already
-		// legible from how far their percentages have climbed.
-		if r.Usage != nil && r.Usage.FiveHour != nil && r.Usage.FiveHour.ResetsAt > nowMs {
-			b.WriteString(" " + slREM + "↻" + fmtRemain((r.Usage.FiveHour.ResetsAt-nowMs)/1000) + slRST)
+		// Only the seven-day window gets a reset countdown: it is the
+		// long-cycle constraint worth tracking, whereas the fast 5h cycle is
+		// already legible from how far its percentage has climbed.
+		if r.Usage != nil && r.Usage.SevenDay != nil && r.Usage.SevenDay.ResetsAt > nowMs {
+			b.WriteString(" " + slREM + "↻" + fmtRemain((r.Usage.SevenDay.ResetsAt-nowMs)/1000) + slRST)
 		}
 		parts = append(parts, b.String())
 	}

@@ -26,7 +26,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -158,8 +160,11 @@ func main() {
 			fatal(err)
 		}
 		logf("active account -> %s", positional[0])
+		// The local switch already succeeded; the broker sync is best-effort and a
+		// scheduled pull will reconcile it. Don't exit non-zero, or callers/plugins
+		// would treat the (successful) account switch as a failure.
 		if n := syncCycle(cfg, client, false); n > 0 {
-			os.Exit(1)
+			logf("active account set to %s, but broker sync failed; credential file not updated yet (will sync on next pull)", positional[0])
 		}
 	case "auto":
 		if n := syncCycle(cfg, client, true); n > 0 {
@@ -1213,9 +1218,30 @@ func httpClient(cfg *config.Agent) (*http.Client, error) {
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
 	}
+	// A custom Transport drops http.DefaultTransport's ProxyFromEnvironment
+	// default, so restore it; an explicit proxyUrl wins (e.g.
+	// "socks5://localhost:1055" for a tailscaled running with
+	// --tun=userspace-networking, where tailnet IPs are only reachable
+	// through its SOCKS5 server).
+	proxy := http.ProxyFromEnvironment
+	if cfg.ProxyURL != "" {
+		u, err := url.Parse(cfg.ProxyURL) // scheme/host already validated by LoadAgent
+		if err != nil {
+			return nil, fmt.Errorf("proxyUrl: %w", err)
+		}
+		proxy = http.ProxyURL(u)
+	}
+	// Short dial + TLS-handshake timeouts so an unreachable broker fails in ~5s
+	// instead of blocking the whole 30s request budget; the 30s Client.Timeout
+	// still caps a slow-but-responding broker.
 	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy:               proxy,
+			TLSClientConfig:     tlsCfg,
+			DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout: 5 * time.Second,
+		},
 	}, nil
 }
 

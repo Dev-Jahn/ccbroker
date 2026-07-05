@@ -159,6 +159,14 @@ See `examples/agent.example.json`. Targets:
 * `{"type":"keychain"}` — macOS; updates the `Claude Code-credentials` Keychain
   item, reusing the account of the existing item.
 
+Optional `proxyUrl` reaches the broker through an explicit `http(s)://`,
+`socks5://` or `socks5h://` proxy — e.g. `"proxyUrl": "socks5://localhost:1055"`
+on a host whose tailscaled runs with `--tun=userspace-networking`, where tailnet
+IPs are only reachable through its SOCKS5 server. As of v0.3.3, when `proxyUrl`
+is empty the agent honors the standard proxy environment variables
+(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`) — earlier versions ignored
+them; if a global proxy is set, `NO_PROXY` can exempt the broker host.
+
 ## Account switching with a single config dir
 
 Instead of one config dir per account (the CCS approach), keep the one

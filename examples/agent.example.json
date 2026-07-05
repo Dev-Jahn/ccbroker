@@ -5,6 +5,7 @@
   "caCertPath": "",
   "clientCertPath": "~/.config/ccbroker/pki/this-machine.crt",
   "clientKeyPath": "~/.config/ccbroker/pki/this-machine.key",
+  "proxyUrl": "",
   "activeFile": "~/.config/ccbroker/active",
   "autoPolicy": "manual",
   "autoThreshold": 0.95,

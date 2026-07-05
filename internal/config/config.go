@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -76,6 +77,10 @@ type Agent struct {
 	// e.g. when the broker sits behind a reverse proxy that verifies client certs.
 	ClientCertPath string `json:"clientCertPath,omitempty"`
 	ClientKeyPath  string `json:"clientKeyPath,omitempty"`
+	// ProxyURL is an explicit proxy for reaching the broker, e.g.
+	// "socks5://localhost:1055" for a tailscaled running with
+	// --tun=userspace-networking; empty honors the standard proxy env vars.
+	ProxyURL string `json:"proxyUrl,omitempty"`
 	// ActiveFile holds the credential name that "@active" targets resolve to;
 	// written by `ccb use <name>`.
 	ActiveFile string `json:"activeFile,omitempty"`
@@ -119,6 +124,12 @@ func LoadAgent(path string) (*Agent, error) {
 	case "", "manual", "account", "all":
 	default:
 		return nil, fmt.Errorf("autoPolicy must be manual, account or all (got %q)", c.AutoPolicy)
+	}
+	if c.ProxyURL != "" {
+		u, err := url.Parse(c.ProxyURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5" && u.Scheme != "socks5h") {
+			return nil, fmt.Errorf("proxyUrl must be http(s)://, socks5:// or socks5h:// (got %q)", c.ProxyURL)
+		}
 	}
 	if c.IntervalSec == 0 {
 		c.IntervalSec = 1800

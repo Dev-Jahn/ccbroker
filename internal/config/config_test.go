@@ -31,6 +31,22 @@ func TestLoadAgentValidAutoPolicy(t *testing.T) {
 	}
 }
 
+func TestLoadAgentProxyURL(t *testing.T) {
+	for _, u := range []string{"socks5://localhost:1055", "socks5h://localhost:1055", "http://p:3128"} {
+		p := writeAgent(t, `{"brokerUrl":"https://b","token":"t","proxyUrl":"`+u+`"}`)
+		if _, err := LoadAgent(p); err != nil {
+			t.Errorf("proxyUrl %q: unexpected error %v", u, err)
+		}
+	}
+	// No scheme (url.Parse still accepts it) and an unsupported scheme.
+	for _, u := range []string{"localhost:1055", "ftp://x"} {
+		p := writeAgent(t, `{"brokerUrl":"https://b","token":"t","proxyUrl":"`+u+`"}`)
+		if _, err := LoadAgent(p); err == nil {
+			t.Errorf("proxyUrl %q: expected error", u)
+		}
+	}
+}
+
 func TestLoadServerDefaultRefreshSkew(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "server.json")
 	// refreshSkewSec absent → must default to 3600 (comfortably above the

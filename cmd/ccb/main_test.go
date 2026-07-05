@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -398,6 +399,55 @@ func TestStatuslineOnOffScript(t *testing.T) {
 	}
 	if string(afterOff2) != scriptContent {
 		t.Errorf("second off changed the script:\n%q", afterOff2)
+	}
+}
+
+func TestHTTPClientTimeouts(t *testing.T) {
+	client, err := httpClient(&config.Agent{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Overall request budget stays at 30s.
+	if client.Timeout != 30*time.Second {
+		t.Errorf("Client.Timeout=%s want 30s", client.Timeout)
+	}
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport is %T want *http.Transport", client.Transport)
+	}
+	// Fail-fast when the broker is unreachable: short dial + TLS-handshake timeouts.
+	if tr.DialContext == nil {
+		t.Error("DialContext not set (dial timeout would be unbounded)")
+	}
+	if tr.TLSHandshakeTimeout != 5*time.Second {
+		t.Errorf("TLSHandshakeTimeout=%s want 5s", tr.TLSHandshakeTimeout)
+	}
+	// Empty proxyUrl keeps the stdlib default our custom Transport would
+	// otherwise drop: proxy env vars are honored.
+	if tr.Proxy == nil {
+		t.Error("Proxy not set; want http.ProxyFromEnvironment")
+	}
+}
+
+func TestHTTPClientProxyURL(t *testing.T) {
+	client, err := httpClient(&config.Agent{ProxyURL: "socks5://localhost:1055"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport is %T want *http.Transport", client.Transport)
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://broker.example.com/v1/usage", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u == nil || u.String() != "socks5://localhost:1055" {
+		t.Errorf("Proxy(req)=%v want socks5://localhost:1055", u)
 	}
 }
 

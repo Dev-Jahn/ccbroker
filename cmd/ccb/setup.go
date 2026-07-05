@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +94,18 @@ func runSetup(cfgPath string, in io.Reader, out io.Writer) error {
 		}
 	}
 
+	proxyURL := ""
+	for {
+		proxyURL = ask("Proxy URL (empty = none/env, e.g. socks5://localhost:1055) []: ")
+		if proxyURL == "" {
+			break
+		}
+		if u, err := url.Parse(proxyURL); err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https" || u.Scheme == "socks5" || u.Scheme == "socks5h") {
+			break
+		}
+		fmt.Fprintln(out, "  must be http(s)://, socks5:// or socks5h://")
+	}
+
 	// @active follows `ccb use`/auto-rotation, so one target serves every account.
 	target := config.Target{Cred: "@active"}
 	useFile := true
@@ -177,6 +190,7 @@ func runSetup(cfgPath string, in io.Reader, out io.Writer) error {
 		CACertPath:     caCert,
 		ClientCertPath: clientCert,
 		ClientKeyPath:  clientKey,
+		ProxyURL:       proxyURL,
 		AutoPolicy:     policy,
 		AutoThreshold:  threshold,
 	}

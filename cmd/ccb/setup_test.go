@@ -21,6 +21,7 @@ func TestRunSetupWritesConfig(t *testing.T) {
 	in.WriteString("tok-abc\n")                    // client token
 	in.WriteString("\n")                           // CA cert (empty default)
 	in.WriteString("\n")                           // client cert (empty default)
+	in.WriteString("\n")                           // proxy URL (empty = none/env)
 	if runtime.GOOS == "darwin" {
 		in.WriteString("2\n") // target menu (darwin only): credentials file
 	}
@@ -58,6 +59,9 @@ func TestRunSetupWritesConfig(t *testing.T) {
 	}
 	if cfg.AutoThreshold != 0.95 {
 		t.Errorf("autoThreshold=%v want 0.95", cfg.AutoThreshold)
+	}
+	if cfg.ProxyURL != "" {
+		t.Errorf("proxyUrl=%q want empty (prompt skipped)", cfg.ProxyURL)
 	}
 	if len(cfg.Targets) != 1 || cfg.Targets[0].Type != "file" || cfg.Targets[0].Cred != "@active" {
 		t.Errorf("targets=%+v", cfg.Targets)

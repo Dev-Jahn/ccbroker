@@ -9,10 +9,6 @@ import (
 	"strings"
 )
 
-// ProfileURL reports the account/organization identity for an OAuth access
-// token. Free to call (no message-quota cost).
-const ProfileURL = "https://api.anthropic.com/api/oauth/profile"
-
 type rawProfile struct {
 	Account struct {
 		UUID      string `json:"uuid"`
@@ -37,9 +33,10 @@ type rawProfile struct {
 // FetchProfile returns the account identity shaped exactly like Claude Code's
 // `.claude.json` "oauthAccount" object, so a client can write it verbatim after
 // switching accounts. profileFetchedAt is filled by the caller (the store has
-// no clock dependency); pass nowMs.
+// no clock dependency); pass nowMs. A non-2xx response is returned as a
+// *StatusError so the caller can classify auth failures apart from transients.
 func FetchProfile(ctx context.Context, accessToken string, nowMs int64) (map[string]any, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ProfileURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, profileURL(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -47,14 +44,14 @@ func FetchProfile(ctx context.Context, accessToken string, nowMs int64) (map[str
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("profile http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &StatusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 
 	var p rawProfile

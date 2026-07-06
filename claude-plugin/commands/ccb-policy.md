@@ -10,4 +10,4 @@ per-model weekly bucket (e.g. a top-tier model's weekly limit) hits it.
 
 If an argument is given, validate it is one of manual|account|all, run
 `ccb policy $ARGUMENTS`, confirm the change, and remind the user it takes
-effect on the next `ccb pull`/`ccb run` cycle.
+effect on the next `ccb sync`/`ccb run` cycle.

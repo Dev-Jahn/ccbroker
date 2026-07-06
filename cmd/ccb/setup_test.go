@@ -75,6 +75,79 @@ func TestRunSetupWritesConfig(t *testing.T) {
 	}
 }
 
+func TestLaunchdWatchPlist(t *testing.T) {
+	got := launchdWatchPlist("/opt/ccb", "/home/me/agent.json", "/var/log/ccb.log")
+	for _, want := range []string{
+		"<string>com.ccbroker.watch</string>",
+		"<string>watch</string>",
+		"<key>KeepAlive</key>",
+		"<true/>",
+		"<string>/opt/ccb</string>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("watch plist missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "StartInterval") {
+		t.Errorf("watch daemon must not use StartInterval:\n%s", got)
+	}
+}
+
+func TestLaunchdSyncPlist(t *testing.T) {
+	got := launchdSyncPlist("/opt/ccb", "/home/me/agent.json", "/var/log/ccb.log", 1800)
+	for _, want := range []string{
+		"<string>com.ccbroker.sync</string>",
+		"<string>sync</string>",
+		"<key>StartInterval</key>",
+		"<integer>1800</integer>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("sync plist missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestSystemdWatchService(t *testing.T) {
+	got := systemdWatchService("/opt/ccb", "/home/me/agent.json")
+	for _, want := range []string{
+		`ExecStart="/opt/ccb" watch -c "/home/me/agent.json"`,
+		"Restart=always",
+		"WantedBy=default.target",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("watch service missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestSystemdSyncUnits(t *testing.T) {
+	service, timer := systemdSyncUnits("/opt/ccb", "/home/me/agent.json", 1800)
+	if !strings.Contains(service, `ExecStart="/opt/ccb" sync -c "/home/me/agent.json"`) {
+		t.Errorf("sync service ExecStart wrong:\n%s", service)
+	}
+	if !strings.Contains(service, "Type=oneshot") {
+		t.Errorf("sync service should be oneshot:\n%s", service)
+	}
+	if !strings.Contains(timer, "OnUnitActiveSec=1800") {
+		t.Errorf("sync timer interval wrong:\n%s", timer)
+	}
+}
+
+func TestCronLines(t *testing.T) {
+	ensureAlive, sync := cronLines("/opt/ccb", "/home/me/agent.json", 1800)
+	if ensureAlive != "*/5 * * * * /opt/ccb ensure-alive -c /home/me/agent.json" {
+		t.Errorf("ensure-alive cron line wrong: %q", ensureAlive)
+	}
+	if sync != "*/30 * * * * /opt/ccb sync -c /home/me/agent.json" {
+		t.Errorf("sync cron line wrong: %q", sync)
+	}
+	// MINOR-7: interval > 3599s must clamp the minute field to ≤59 (»/60 is an
+	// invalid crontab minute).
+	if _, sync := cronLines("/opt/ccb", "/c", 7200); !strings.Contains(sync, "*/59 ") {
+		t.Errorf("interval 7200 should clamp minute to 59, got %q", sync)
+	}
+}
+
 func TestRunSetupOverwriteRefused(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)

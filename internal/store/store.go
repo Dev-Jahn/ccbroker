@@ -113,6 +113,9 @@ func (s *Store) saveLocked() error {
 	return os.Rename(tmpName, s.path)
 }
 
+// Path returns the store file path.
+func (s *Store) Path() string { return s.path }
+
 // Get returns the current (immutable) record for name.
 func (s *Store) Get(name string) (*creds.Record, bool) {
 	s.mu.RLock()

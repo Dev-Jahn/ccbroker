@@ -10,18 +10,73 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
-const (
-	// ClientID is the public OAuth client id used by Claude Code.
-	ClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	// TokenURL is the refresh endpoint that is not Cloudflare-challenged.
-	TokenURL = "https://api.anthropic.com/v1/oauth/token"
-)
+// ClientID is the public OAuth client id used by Claude Code.
+const ClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+// Endpoint is the Anthropic host serving the OAuth endpoints. It is a var (not
+// a const) so integration tests can point every call at an httptest fake
+// upstream; production always uses api.anthropic.com, which — unlike the
+// documented console.anthropic.com host — is not behind a Cloudflare challenge.
+var Endpoint = "https://api.anthropic.com"
+
+// HTTPClient performs every OAuth request. Overridable in tests.
+var HTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+func tokenURL() string   { return Endpoint + "/v1/oauth/token" }
+func profileURL() string { return Endpoint + "/api/oauth/profile" }
+func usageURL() string   { return Endpoint + "/api/oauth/usage" }
+
+// StatusError is a non-2xx HTTP response from a free OAuth endpoint
+// (profile/usage). It carries the status code so callers can classify auth
+// failures (401 / 403-revoked) apart from transient ones (429/5xx/network) —
+// only the former count toward a credential's health (design S7).
+type StatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("http %d: %s", e.Status, truncate(e.Body, 200))
+}
+
+// Status returns the HTTP status carried by err, or 0 for a network-level
+// error (no response at all).
+func Status(err error) int {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Status
+	}
+	return 0
+}
+
+// Revoked reports whether err is a 403 whose body indicates the OAuth token was
+// revoked. Claude Code treats this like a 401 (design CC8/F1), attributing it to
+// another process having refreshed (and thereby rotated) the token.
+func Revoked(err error) bool {
+	var se *StatusError
+	if errors.As(err, &se) && se.Status == http.StatusForbidden {
+		return strings.Contains(strings.ToLower(se.Body), "revoked")
+	}
+	return false
+}
+
+// AuthFailure reports whether err means the access token is no longer valid: a
+// 401, or a 403 whose body says "revoked". Transient statuses (429/5xx) and
+// network errors are not auth failures and must never affect health (S7).
+func AuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return Status(err) == http.StatusUnauthorized || Revoked(err)
+}
 
 // Result is the successful refresh response.
 type Result struct {
@@ -57,8 +112,6 @@ func truncate(s string, n int) string {
 	return s
 }
 
-var client = &http.Client{Timeout: 30 * time.Second}
-
 // Refresh exchanges a refresh token for a fresh access+refresh token pair.
 // Anthropic rotates the refresh token on every call.
 func Refresh(ctx context.Context, refreshToken string) (*Result, error) {
@@ -67,7 +120,7 @@ func Refresh(ctx context.Context, refreshToken string) (*Result, error) {
 		"refresh_token": refreshToken,
 		"client_id":     ClientID,
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, TokenURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +129,7 @@ func Refresh(ctx context.Context, refreshToken string) (*Result, error) {
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("User-Agent", "claude-cli/2.1.199 (external, cli)")
 
-	resp, err := client.Do(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return nil, &Err{Status: 0, Body: err.Error(), Permanent: false}
 	}

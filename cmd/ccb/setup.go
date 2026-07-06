@@ -232,68 +232,93 @@ func yes(ans string, def bool) bool {
 	}
 }
 
-// offerScheduler offers to install a per-user scheduler that runs `ccb pull`
-// on the sync interval. Unit-file contents come from the pure builders below;
-// only command execution lives here. cfgPath must already be absolute.
+// offerScheduler installs the watch daemon as the DEFAULT (design C3): a
+// long-poll daemon that syncs on every rotation, plus a periodic `ccb sync`
+// watchdog that bounds the outage if the daemon dies. Unit-file contents come
+// from the pure builders below; only command execution lives here. cfgPath must
+// already be absolute.
 func offerScheduler(cfgPath string, interval int64, ask func(string) string, out io.Writer) {
 	exe, err := resolveExe()
 	if err != nil {
 		fmt.Fprintf(out, "scheduler skipped: %v\n", err)
 		return
 	}
+	logPath := expandHome("~/.config/ccbroker/agent.log")
+	outageBound := func() {
+		fmt.Fprintf(out, "If the watch daemon stops, the sync watchdog bounds any outage to ≤%ds (one sync interval).\n", interval)
+	}
 	switch runtime.GOOS {
 	case "darwin":
-		if !yes(ask(fmt.Sprintf("Install a launchd agent to run 'ccb pull' every %ds? [Y/n]: ", interval)), true) {
+		if !yes(ask("Install a launchd watch daemon (+ periodic sync watchdog)? [Y/n]: "), true) {
+			fmt.Fprintln(out, "skipped; run `ccb watch` under your own supervisor or re-run `ccb setup`.")
 			return
 		}
-		plist := expandHome("~/Library/LaunchAgents/com.ccbroker.pull.plist")
-		logPath := expandHome("~/.config/ccbroker/agent.log")
-		if err := writeFile(plist, []byte(launchdPlist(exe, cfgPath, logPath, interval))); err != nil {
+		watch := expandHome("~/Library/LaunchAgents/com.ccbroker.watch.plist")
+		sync := expandHome("~/Library/LaunchAgents/com.ccbroker.sync.plist")
+		if err := writeFile(watch, []byte(launchdWatchPlist(exe, cfgPath, logPath))); err != nil {
 			fmt.Fprintf(out, "scheduler failed: %v\n", err)
 			return
 		}
-		exec.Command("launchctl", "unload", plist).Run() // ignore: not loaded yet
-		if err := exec.Command("launchctl", "load", "-w", plist).Run(); err != nil {
-			fmt.Fprintf(out, "launchctl load failed: %v\n", err)
+		if err := writeFile(sync, []byte(launchdSyncPlist(exe, cfgPath, logPath, interval))); err != nil {
+			fmt.Fprintf(out, "scheduler failed: %v\n", err)
 			return
 		}
-		fmt.Fprintf(out, "launchd agent installed. Undo with: launchctl unload %s && rm %s\n", plist, plist)
+		for _, p := range []string{watch, sync} {
+			exec.Command("launchctl", "unload", p).Run() // ignore: not loaded yet
+			if err := exec.Command("launchctl", "load", "-w", p).Run(); err != nil {
+				fmt.Fprintf(out, "launchctl load failed: %v\n", err)
+				return
+			}
+		}
+		fmt.Fprintf(out, "launchd watch daemon + sync watchdog installed. Undo with:\n  launchctl unload %s %s && rm %s %s\n", watch, sync, watch, sync)
+		outageBound()
 	case "linux":
 		unitDir := expandHome("~/.config/systemd/user")
 		if err := os.MkdirAll(unitDir, 0o700); err != nil || exec.Command("systemctl", "--user", "daemon-reload").Run() != nil {
-			printCrontab(out, exe, cfgPath, interval)
+			printCronFallback(out, exe, cfgPath, interval)
 			return
 		}
-		if !yes(ask(fmt.Sprintf("Install a systemd user timer to run 'ccb pull' every %ds? [Y/n]: ", interval)), true) {
+		if !yes(ask("Install a systemd-user watch service (Restart=always) + periodic sync watchdog? [Y/n]: "), true) {
+			fmt.Fprintln(out, "skipped; run `ccb watch` under your own supervisor or re-run `ccb setup`.")
 			return
 		}
-		service, timer := systemdUnits(exe, cfgPath, interval)
-		if err := writeFile(filepath.Join(unitDir, "ccb-pull.service"), []byte(service)); err != nil {
-			fmt.Fprintf(out, "scheduler failed: %v\n", err)
-			return
-		}
-		if err := writeFile(filepath.Join(unitDir, "ccb-pull.timer"), []byte(timer)); err != nil {
-			fmt.Fprintf(out, "scheduler failed: %v\n", err)
-			return
+		service := systemdWatchService(exe, cfgPath)
+		syncSvc, syncTimer := systemdSyncUnits(exe, cfgPath, interval)
+		for name, body := range map[string]string{
+			"ccb-watch.service": service,
+			"ccb-sync.service":  syncSvc,
+			"ccb-sync.timer":    syncTimer,
+		} {
+			if err := writeFile(filepath.Join(unitDir, name), []byte(body)); err != nil {
+				fmt.Fprintf(out, "scheduler failed: %v\n", err)
+				return
+			}
 		}
 		exec.Command("systemctl", "--user", "daemon-reload").Run()
-		if err := exec.Command("systemctl", "--user", "enable", "--now", "ccb-pull.timer").Run(); err != nil {
-			fmt.Fprintf(out, "systemctl enable failed: %v\n", err)
+		if err := exec.Command("systemctl", "--user", "enable", "--now", "ccb-watch.service").Run(); err != nil {
+			fmt.Fprintf(out, "systemctl enable ccb-watch failed: %v\n", err)
 			return
 		}
-		fmt.Fprintln(out, "systemd user timer installed. To run while logged out: sudo loginctl enable-linger $USER")
+		if err := exec.Command("systemctl", "--user", "enable", "--now", "ccb-sync.timer").Run(); err != nil {
+			fmt.Fprintf(out, "systemctl enable ccb-sync.timer failed: %v\n", err)
+			return
+		}
+		fmt.Fprintln(out, "systemd-user watch service + sync watchdog installed. To run while logged out: sudo loginctl enable-linger $USER")
+		outageBound()
 	default:
-		printCrontab(out, exe, cfgPath, interval)
+		printCronFallback(out, exe, cfgPath, interval)
 	}
 }
 
-func printCrontab(out io.Writer, exe, cfgPath string, interval int64) {
-	mins := interval / 60
-	if mins < 1 {
-		mins = 1
-	}
-	fmt.Fprintln(out, "No supported scheduler detected. Add this crontab line (crontab -e) to pull periodically:")
-	fmt.Fprintf(out, "  */%d * * * * %s pull -c %s\n", mins, exe, cfgPath)
+// printCronFallback prints the crontab lines for a host with no launchd/systemd:
+// a */5 ensure-alive wrapper that restarts the watch daemon, plus the periodic
+// sync watchdog (design C3).
+func printCronFallback(out io.Writer, exe, cfgPath string, interval int64) {
+	ensureAlive, sync := cronLines(exe, cfgPath, interval)
+	fmt.Fprintln(out, "No supported service manager detected. Run `ccb watch` under your process supervisor,")
+	fmt.Fprintln(out, "or add these crontab lines (crontab -e) — the first keeps the watch daemon alive, the second is the sync watchdog:")
+	fmt.Fprintf(out, "  %s\n  %s\n", ensureAlive, sync)
+	fmt.Fprintf(out, "If the watch daemon stops, the sync watchdog bounds any outage to ≤%ds (one sync interval).\n", interval)
 }
 
 // resolveExe returns the absolute, symlink-resolved path of the running binary
@@ -310,10 +335,9 @@ func resolveExe() (string, error) {
 // malformed when a path contains &, <, or > (e.g. a "Foo & Bar" directory).
 var xmlEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
 
-// launchdPlist builds the LaunchAgent plist that runs `ccb pull` every interval
-// seconds. Pure: no I/O, for testability.
-func launchdPlist(exe, cfgPath, logPath string, interval int64) string {
-	// Paths land inside <string> elements, so XML-escape them first.
+// launchdWatchPlist builds the KeepAlive LaunchAgent that runs the `ccb watch`
+// daemon (design C3). Pure: no I/O, for testability.
+func launchdWatchPlist(exe, cfgPath, logPath string) string {
 	exe = xmlEscaper.Replace(exe)
 	cfgPath = xmlEscaper.Replace(cfgPath)
 	logPath = xmlEscaper.Replace(logPath)
@@ -322,11 +346,43 @@ func launchdPlist(exe, cfgPath, logPath string, interval int64) string {
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.ccbroker.pull</string>
+	<string>com.ccbroker.watch</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>%s</string>
-		<string>pull</string>
+		<string>watch</string>
+		<string>-c</string>
+		<string>%s</string>
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>%s</string>
+	<key>StandardErrorPath</key>
+	<string>%s</string>
+</dict>
+</plist>
+`, exe, cfgPath, logPath, logPath)
+}
+
+// launchdSyncPlist builds the StartInterval LaunchAgent that runs `ccb sync`
+// every interval seconds as the watchdog fallback. Pure: no I/O, for testability.
+func launchdSyncPlist(exe, cfgPath, logPath string, interval int64) string {
+	exe = xmlEscaper.Replace(exe)
+	cfgPath = xmlEscaper.Replace(cfgPath)
+	logPath = xmlEscaper.Replace(logPath)
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ccbroker.sync</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+		<string>sync</string>
 		<string>-c</string>
 		<string>%s</string>
 	</array>
@@ -352,23 +408,43 @@ func systemdQuote(s string) string {
 	return `"` + s + `"`
 }
 
-// systemdUnits builds the ccb-pull.service (oneshot) and ccb-pull.timer that
-// run `ccb pull` every interval seconds. Pure: no I/O, for testability.
-func systemdUnits(exe, cfgPath string, interval int64) (service, timer string) {
+// systemdWatchService builds the ccb-watch.service (Restart=always) that runs
+// the `ccb watch` daemon. Pure: no I/O, for testability.
+func systemdWatchService(exe, cfgPath string) string {
+	return fmt.Sprintf(`[Unit]
+Description=ccbroker credential watch daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%s watch -c %s
+Restart=always
+RestartSec=5
+StandardOutput=append:%%h/.config/ccbroker/agent.log
+StandardError=append:%%h/.config/ccbroker/agent.log
+
+[Install]
+WantedBy=default.target
+`, systemdQuote(exe), systemdQuote(cfgPath))
+}
+
+// systemdSyncUnits builds the ccb-sync.service (oneshot) and ccb-sync.timer that
+// run `ccb sync` every interval seconds as the watchdog fallback. Pure: no I/O.
+func systemdSyncUnits(exe, cfgPath string, interval int64) (service, timer string) {
 	service = fmt.Sprintf(`[Unit]
-Description=ccbroker credential pull
+Description=ccbroker credential sync watchdog
 
 [Service]
 Type=oneshot
-ExecStart=%s pull -c %s
+ExecStart=%s sync -c %s
 StandardOutput=append:%%h/.config/ccbroker/agent.log
 StandardError=append:%%h/.config/ccbroker/agent.log
 `, systemdQuote(exe), systemdQuote(cfgPath))
 	timer = fmt.Sprintf(`[Unit]
-Description=ccbroker credential pull timer
+Description=ccbroker credential sync watchdog timer
 
 [Timer]
-OnBootSec=15
+OnBootSec=60
 OnUnitActiveSec=%d
 Persistent=true
 
@@ -376,4 +452,19 @@ Persistent=true
 WantedBy=timers.target
 `, interval)
 	return service, timer
+}
+
+// cronLines builds the crontab fallback: a */5 ensure-alive wrapper (restarts
+// the watch daemon) and the periodic sync watchdog. Pure: no I/O.
+func cronLines(exe, cfgPath string, interval int64) (ensureAlive, sync string) {
+	mins := interval / 60
+	if mins < 1 {
+		mins = 1
+	}
+	if mins > 59 {
+		mins = 59 // the cron minute field is 0-59; */60 is invalid (MINOR-7)
+	}
+	ensureAlive = fmt.Sprintf("*/5 * * * * %s ensure-alive -c %s", exe, cfgPath)
+	sync = fmt.Sprintf("*/%d * * * * %s sync -c %s", mins, exe, cfgPath)
+	return ensureAlive, sync
 }

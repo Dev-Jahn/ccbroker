@@ -47,6 +47,20 @@ func TestLoadAgentProxyURL(t *testing.T) {
 	}
 }
 
+func TestLoadAgentDefaults(t *testing.T) {
+	p := writeAgent(t, `{"brokerUrl":"https://b","token":"t"}`)
+	c, err := LoadAgent(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.IntervalSec != 1800 {
+		t.Errorf("IntervalSec default=%d want 1800", c.IntervalSec)
+	}
+	if c.WatchWaitSec != 20 {
+		t.Errorf("WatchWaitSec default=%d want 20", c.WatchWaitSec)
+	}
+}
+
 func TestLoadServerDefaultRefreshSkew(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "server.json")
 	// refreshSkewSec absent → must default to 3600 (comfortably above the

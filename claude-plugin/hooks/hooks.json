@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "ccb pull",
+            "command": "ccb sync",
             "timeout": 15
           }
         ]

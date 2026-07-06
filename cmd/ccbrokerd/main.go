@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Dev-Jahn/ccbroker/internal/config"
 	"github.com/Dev-Jahn/ccbroker/internal/server"
@@ -94,6 +95,16 @@ func serve(args []string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Startup migration (S8): populate Account/AccountUUID + gen for inherited
+	// v0.3 records and assert account uniqueness before any offer is served.
+	// A duplicate account is fatal (refuse to start).
+	mctx, mcancel := context.WithTimeout(ctx, 90*time.Second)
+	if err := srv.Migrate(mctx); err != nil {
+		mcancel()
+		fatal(err)
+	}
+	mcancel()
 
 	go srv.RunRefreshLoop(ctx)
 	go srv.RunUsageLoop(ctx)

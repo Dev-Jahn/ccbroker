@@ -2,6 +2,7 @@
   "brokerUrl": "https://ccbroker.example.com",
   "token": "REPLACE_WITH_THIS_MACHINE_CLIENT_TOKEN",
   "intervalSec": 1800,
+  "watchWaitSec": 20,
   "caCertPath": "",
   "clientCertPath": "~/.config/ccbroker/pki/this-machine.crt",
   "clientKeyPath": "~/.config/ccbroker/pki/this-machine.key",

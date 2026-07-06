@@ -21,9 +21,10 @@ work.
 
 ## SessionStart hook
 
-The plugin registers a `SessionStart` hook that runs `ccb pull`, so every new
+The plugin registers a `SessionStart` hook that runs `ccb sync`, so every new
 Claude Code session starts with a freshly refreshed token and an up-to-date quota
-cache.
+cache. `ccb sync` also offers any local `/login` credential to the broker (the
+account on-ramp) before writing back the active account's token.
 
 ## Requirements
 

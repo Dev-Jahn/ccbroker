@@ -11,10 +11,6 @@ import (
 	"time"
 )
 
-// UsageURL reports subscription quota utilization for an OAuth access token
-// WITHOUT consuming message quota, which makes it safe to poll.
-const UsageURL = "https://api.anthropic.com/api/oauth/usage"
-
 // Bucket is one normalized quota window.
 type Bucket struct {
 	Utilization float64 `json:"utilization"`        // 0-1 (may exceed 1 in overage)
@@ -78,9 +74,10 @@ type rawUsage struct {
 	Limits   []rawLimit `json:"limits"`
 }
 
-// FetchUsage queries the usage endpoint with an access token.
+// FetchUsage queries the usage endpoint with an access token. A non-2xx
+// response is returned as a *StatusError carrying the status code.
 func FetchUsage(ctx context.Context, accessToken string) (*Usage, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, UsageURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -88,14 +85,14 @@ func FetchUsage(ctx context.Context, accessToken string) (*Usage, error) {
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := HTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("usage http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &StatusError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 
 	var raw rawUsage

@@ -28,6 +28,11 @@ type Server struct {
 	RefreshSkewSec int64    `json:"refreshSkewSec"` // refresh N sec before expiry; keep well above agents' intervalSec (default 3600)
 	UsagePollSec   int64    `json:"usagePollSec"`   // poll quota usage every N sec
 	Clients        []Client `json:"clients"`
+	// ServeRefreshToken keeps the refresh token in served credentials (design
+	// S1/M-7 rollout escape hatch). Default false: refresh tokens are quarantined
+	// in the broker store (invariant I1). Set true during the rollout window while
+	// pre-v0.4 clients still self-heal from a served refresh token.
+	ServeRefreshToken bool `json:"serveRefreshToken,omitempty"`
 }
 
 // LoadServer reads and validates a server config file.
@@ -94,6 +99,9 @@ type Agent struct {
 	//   "all"     — additionally rotate when any model-scoped weekly bucket reaches it
 	// Empty falls back to the legacy Auto bool (true→account, false→manual).
 	AutoPolicy string `json:"autoPolicy,omitempty"`
+	// WatchWaitSec is the long-poll wait `ccb watch` requests per iteration; the
+	// broker clamps it to ≤25 (design S3/C2). Default 20.
+	WatchWaitSec int64 `json:"watchWaitSec,omitempty"`
 }
 
 // EffectivePolicy resolves AutoPolicy, falling back to the legacy Auto bool.
@@ -133,6 +141,9 @@ func LoadAgent(path string) (*Agent, error) {
 	}
 	if c.IntervalSec == 0 {
 		c.IntervalSec = 1800
+	}
+	if c.WatchWaitSec == 0 {
+		c.WatchWaitSec = 20
 	}
 	if c.ActiveFile == "" {
 		c.ActiveFile = "~/.config/ccbroker/active"

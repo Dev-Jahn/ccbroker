@@ -4,7 +4,10 @@
 //
 // Usage:
 //
-//	ccb pull        [-c agent.json]   # one-shot sync (+auto-rotate per policy)
+//	ccb sync        [-c agent.json]   # one-shot sync (offer local /login, adopt, +auto-rotate)
+//	ccb pull        [-c agent.json]   # alias of sync (kept for compatibility)
+//	ccb watch       [-c agent.json]   # foreground daemon: long-poll + sync on every change
+//	ccb ensure-alive [-c agent.json]  # start `ccb watch` if not running (cron fallback)
 //	ccb run         [-c agent.json]   # sync on an interval
 //	ccb use <name>  [-c agent.json]   # switch the "@active" account and sync
 //	ccb auto        [-c agent.json]   # switch to the least-utilized account and sync
@@ -20,22 +23,28 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -50,7 +59,7 @@ var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: ccb {pull|run|use <name>|auto|status|statusline|policy [value]|setup|version} [-c agent.json]")
+		fmt.Fprintln(os.Stderr, "usage: ccb {sync|pull|watch|ensure-alive|run|use <name>|auto|status|statusline|policy [value]|setup|version} [-c agent.json]")
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
@@ -141,9 +150,15 @@ func main() {
 	}
 
 	switch cmd {
-	case "pull":
+	case "sync", "pull":
 		if n := syncCycle(cfg, client, false); n > 0 {
 			os.Exit(1)
+		}
+	case "watch":
+		runWatch(cfg, client)
+	case "ensure-alive":
+		if err := runEnsureAlive(cfg, cfgPath); err != nil {
+			fatal(err)
 		}
 	case "run":
 		iv := time.Duration(cfg.IntervalSec) * time.Second
@@ -334,36 +349,158 @@ func syncAll(cfg *config.Agent, client *http.Client, rows []usageRow) int {
 	}
 	fails := 0
 	for _, t := range cfg.Targets {
-		name, err := resolveCred(cfg, t.Cred)
-		if err != nil {
-			logf("target=%s SKIP %v", t.Type, err)
+		if syncTarget(cfg, client, t, byName) {
 			fails++
-			continue
-		}
-		body, err := fetchCred(cfg, client, name)
-		if err != nil {
-			logf("cred=%s FETCH_FAIL %v", name, err)
-			fails++
-			continue
-		}
-		if err := writeTarget(t, body); err != nil {
-			logf("cred=%s target=%s WRITE_FAIL %v", name, t.Type, err)
-			fails++
-			continue
-		}
-		logf("cred=%s target=%s -> %s OK", name, t.Type, t.Path)
-		if row, ok := byName[name]; ok && row.OAuthAccount != nil {
-			if cj := claudeJSONForTarget(t); cj != "" {
-				switch changed, err := syncIdentity(cj, row.OAuthAccount); {
-				case err != nil:
-					logf("cred=%s identity WARN %v", name, err)
-				case changed:
-					logf("cred=%s identity -> %s updated", name, cj)
-				}
-			}
 		}
 	}
 	return fails
+}
+
+// syncTarget syncs one target per the C1 overwrite gate: it offers any local
+// /login credential (the on-ramp), fetches the target's configured cred, and
+// overwrites the local copy ONLY when the local refresh token is provably safe
+// (no local RT, offer adopted, definitive already_current/rollback, or
+// offer_not_live + a fresh broker probe). Every failure mode keeps the local RT
+// intact (invariant I1 / C-1). Returns true on a transient failure worth
+// retrying next cycle.
+func syncTarget(cfg *config.Agent, client *http.Client, t config.Target, byName map[string]usageRow) (fail bool) {
+	local, rerr := readLocalOAuth(t)
+	if rerr != nil {
+		// A read FAILURE is not "no credential" (MAJOR-1): treating it as empty
+		// could overwrite a target that actually holds a live refresh token we just
+		// couldn't read. Skip this target and retry next cycle.
+		logf("target=%s local read error, skipping this cycle: %v", t.Type, rerr)
+		return true
+	}
+	hasRT := local != nil && oauthStr(local, "refreshToken") != ""
+
+	// (b) if the local target holds a refresh token, ALWAYS offer it — the broker
+	// is the only adjudicator (account-routed). This is the /login on-ramp.
+	var adopted bool
+	var reason, adoptedName, offerEmail string
+	if hasRT {
+		res := offerCred(cfg, client, local)
+		adopted, reason, adoptedName, offerEmail = res.Adopted, res.Reason, res.Name, res.Account
+		logf("target=%s offer -> adopted=%v reason=%s name=%s", t.Type, adopted, reason, adoptedName)
+	}
+
+	name, err := resolveCred(cfg, t.Cred)
+	if err != nil {
+		logf("target=%s SKIP %v", t.Type, err)
+		return true
+	}
+
+	// (c) GET the target's cred, probing for a liveness proof only when the
+	// overwrite gate will need one (the offer_not_live cleanup path).
+	needProbe := hasRT && reason == "offer_not_live"
+	env, status, gerr := getCredEnvelope(cfg, client, name, needProbe)
+	if gerr != nil {
+		if !hasRT {
+			// Plain propagation wanted but the broker cred is unavailable.
+			logf("cred=%s FETCH_FAIL (http %d) %v", name, status, gerr)
+			return true
+		}
+		logf("cred=%s keep-local (GET http %d): %v", name, status, gerr)
+		return true
+	}
+
+	// (d) overwrite gate.
+	if !overwriteDecision(hasRT, adopted, reason, env.ProbeLive) {
+		warnKeepLocal(name, reason, offerEmail)
+		return transientReason(reason)
+	}
+
+	// (e) client-side strip on ALL writes (I1): never write a refresh token to any
+	// target, regardless of broker version; write is atomic (temp+rename / single
+	// keychain update).
+	stripped := stripRefreshToken(env.ClaudeAiOauth)
+	body, err := json.Marshal(credFile{ClaudeAiOauth: stripped})
+	if err != nil {
+		logf("cred=%s ENCODE_FAIL %v", name, err)
+		return true
+	}
+	// TOCTOU guard (MAJOR-2): re-read the target immediately before writing and
+	// abort if it changed since the gate evaluated `local` — in particular if a
+	// concurrent /login dropped a fresh refresh token there. Retry next cycle.
+	switch wrote, werr := writeIfUnchanged(t, local, body); {
+	case werr != nil:
+		logf("cred=%s target=%s WRITE_FAIL %v", name, t.Type, werr)
+		return true
+	case !wrote:
+		logf("cred=%s target changed under us (concurrent /login?); keeping local, retry next cycle", name)
+		return true
+	}
+	logf("cred=%s target=%s -> %s OK", name, t.Type, t.Path)
+
+	// A /login adopted into a cred other than @active: the local RT is safe in the
+	// broker and local was restored to the active account.
+	if adopted && adoptedName != "" && adoptedName != name {
+		logf("adopted %s; local restored to active %s; use `ccb use %s` to switch", adoptedName, name, adoptedName)
+	}
+
+	if row, ok := byName[name]; ok && row.OAuthAccount != nil {
+		if cj := claudeJSONForTarget(t); cj != "" {
+			switch changed, err := syncIdentity(cj, row.OAuthAccount); {
+			case err != nil:
+				logf("cred=%s identity WARN %v", name, err)
+			case changed:
+				logf("cred=%s identity -> %s updated", name, cj)
+			}
+		}
+	}
+	return false
+}
+
+// overwriteDecision decides whether to write the broker cred over the local
+// target. It NEVER returns true for a branch that would destroy a live local
+// refresh token (invariant I1 / C-1 regression). See design C1.d.
+func overwriteDecision(hasLocalRT, adopted bool, reason string, probeLive bool) bool {
+	if !hasLocalRT {
+		return true // plain propagation — nothing to lose
+	}
+	if adopted {
+		return true // lineage safely in the broker
+	}
+	switch reason {
+	case "already_current", "rollback":
+		return true // proof the local token is not a new lineage
+	case "offer_not_live":
+		return probeLive // local dead, broker verified-alive NOW (legacy-landmine cleanup)
+	}
+	// unknown_account / ambiguous_account / migration_pending / verify_unavailable
+	// / conflict / rate_limited / old_broker / offer_error / probeLive==false.
+	return false
+}
+
+// transientReason reports whether a keep-local reason is transient (retry next
+// cycle) rather than a deliberate, persistent keep (unknown/ambiguous account).
+func transientReason(reason string) bool {
+	switch reason {
+	case "unknown_account", "ambiguous_account":
+		return false
+	default:
+		return true
+	}
+}
+
+// warnKeepLocal explains why the local credential was kept. unknown_account is a
+// loud, actionable warning: the account is not broker-managed at all, so its
+// credential (a multi-refresher hazard) sits unmanaged on disk.
+func warnKeepLocal(name, reason, offerEmail string) {
+	who := offerEmail
+	if who == "" {
+		who = "the local account"
+	}
+	switch reason {
+	case "unknown_account":
+		logf("WARN account %s is not broker-managed; its credential sits on this disk unmanaged (multi-refresher risk for that account) — log out, or import it into the broker", who)
+	case "ambiguous_account":
+		logf("cred=%s keep-local: offer ambiguous_account (%s); not overwriting", name, who)
+	case "migration_pending":
+		logf("cred=%s keep-local: broker migration in progress; retry next cycle", name)
+	default:
+		logf("cred=%s keep-local: offer/GET %s; retry next cycle", name, reason)
+	}
 }
 
 // claudeJSONForTarget returns the .claude.json Claude Code actually reads for a
@@ -459,8 +596,191 @@ func writeActive(path, name string) error {
 
 // ---- broker API ----
 
-func fetchCred(cfg *config.Agent, client *http.Client, name string) ([]byte, error) {
-	return brokerGet(cfg, client, "/v1/credentials/"+name)
+// credFile is the on-disk ~/.claude/.credentials.json layout Claude Code reads.
+type credFile struct {
+	ClaudeAiOauth map[string]any `json:"claudeAiOauth"`
+}
+
+// credEnvelope is the v0.4 GET /v1/credentials/{name} response: the (stripped)
+// claudeAiOauth object plus routing/liveness envelope fields. Against a pre-v0.4
+// broker the body is a bare credFile, which still decodes here (gen 0, account
+// "", probeLive false).
+type credEnvelope struct {
+	ClaudeAiOauth map[string]any `json:"claudeAiOauth"`
+	Gen           int64          `json:"gen"`
+	Account       string         `json:"account"`
+	ProbeLive     bool           `json:"probeLive"`
+}
+
+// offerResult is the POST /v1/creds/offer response (design S2).
+type offerResult struct {
+	Adopted bool   `json:"adopted"`
+	Name    string `json:"name"`
+	Reason  string `json:"reason"`
+	Account string `json:"account"`
+	Gen     int64  `json:"gen"`
+}
+
+// getCredEnvelope fetches a credential, requesting a fresh liveness probe when
+// probe is set (design S2b). Non-200 statuses (409 suspect, 503, 404) are
+// returned as errors so the caller keeps the local credential.
+func getCredEnvelope(cfg *config.Agent, client *http.Client, name string, probe bool) (*credEnvelope, int, error) {
+	path := "/v1/credentials/" + name
+	if probe {
+		path += "?probe=1"
+	}
+	status, _, body, err := brokerGetFull(cfg, client, path)
+	if err != nil {
+		return nil, status, err
+	}
+	if status != http.StatusOK {
+		return nil, status, fmt.Errorf("http %d: %s", status, strings.TrimSpace(string(body)))
+	}
+	var e credEnvelope
+	if err := json.Unmarshal(body, &e); err != nil {
+		return nil, status, fmt.Errorf("decode credential: %w", err)
+	}
+	return &e, status, nil
+}
+
+// offerCred POSTs the local (full, with-RT) credential to the broker's
+// account-routed offer endpoint. Transport/HTTP failures are mapped to a reason
+// the overwrite gate treats as keep-local. A pre-v0.4 broker (no offer endpoint)
+// 404s → reason "old_broker".
+func offerCred(cfg *config.Agent, client *http.Client, oauth map[string]any) offerResult {
+	body, err := json.Marshal(oauth)
+	if err != nil {
+		return offerResult{Reason: "offer_error"}
+	}
+	req, err := http.NewRequest(http.MethodPost, cfg.BrokerURL+"/v1/creds/offer", bytes.NewReader(body))
+	if err != nil {
+		return offerResult{Reason: "offer_error"}
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return offerResult{Reason: "offer_error"}
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var res offerResult
+		if err := json.Unmarshal(raw, &res); err != nil {
+			return offerResult{Reason: "offer_error"}
+		}
+		return res
+	case http.StatusNotFound:
+		return offerResult{Reason: "old_broker"}
+	case http.StatusTooManyRequests:
+		return offerResult{Reason: "rate_limited"}
+	case http.StatusBadRequest:
+		return offerResult{Reason: "bad_offer"}
+	default:
+		return offerResult{Reason: "offer_error"}
+	}
+}
+
+// stripRefreshToken returns a copy of oauth without the refresh token (I1).
+func stripRefreshToken(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if k == "refreshToken" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// readLocalOAuth reads the claudeAiOauth object currently at a target, or nil if
+// the target holds no credential yet.
+func readLocalOAuth(t config.Target) (map[string]any, error) {
+	var raw []byte
+	switch t.Type {
+	case "file":
+		b, err := os.ReadFile(expandHome(t.Path))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		raw = b
+	case "keychain":
+		b, err := readKeychain()
+		if err != nil {
+			if errors.Is(err, errKeychainNoItem) {
+				return nil, nil // genuinely no item yet
+			}
+			return nil, err // a real read failure — do NOT treat as empty (MAJOR-1)
+		}
+		raw = b
+	default:
+		return nil, fmt.Errorf("unknown target type %q", t.Type)
+	}
+	return parseOAuthBytes(raw), nil
+}
+
+// parseOAuthBytes extracts the claudeAiOauth object from a credentials file (or
+// a bare oauth object), or nil if neither is present.
+func parseOAuthBytes(raw []byte) map[string]any {
+	var f credFile
+	if err := json.Unmarshal(raw, &f); err == nil && f.ClaudeAiOauth != nil {
+		return f.ClaudeAiOauth
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err == nil {
+		if _, ok := m["accessToken"]; ok {
+			return m
+		}
+	}
+	return nil
+}
+
+// oauthStr reads a string field from an oauth map.
+func oauthStr(m map[string]any, k string) string {
+	s, _ := m[k].(string)
+	return s
+}
+
+// errKeychainNoItem signals that the keychain has no Claude Code item — the ONLY
+// keychain failure that means "no local credential" (exit 44 = errSecItemNotFound).
+// Any other `security` failure is a genuine read error (MAJOR-1).
+var errKeychainNoItem = errors.New("keychain: no such item")
+
+// readKeychain returns the JSON blob stored in the macOS "Claude Code-credentials"
+// keychain item.
+func readKeychain() ([]byte, error) {
+	if runtime.GOOS != "darwin" {
+		return nil, fmt.Errorf("keychain target is only supported on macOS")
+	}
+	out, err := exec.Command("security", "find-generic-password", "-s", keychainService, "-w").Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 44 {
+			return nil, errKeychainNoItem // errSecItemNotFound
+		}
+		return nil, err
+	}
+	return bytes.TrimSpace(out), nil
+}
+
+// brokerGetFull issues a GET and returns the status, headers and body.
+func brokerGetFull(cfg *config.Agent, client *http.Client, path string) (int, http.Header, []byte, error) {
+	req, err := http.NewRequest(http.MethodGet, cfg.BrokerURL+path, nil)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, resp.Header, body, nil
 }
 
 // usageRow mirrors one entry of the broker's /v1/usage response.
@@ -468,6 +788,7 @@ type usageRow struct {
 	Name           string           `json:"name"`
 	Account        string           `json:"account,omitempty"`
 	Dead           bool             `json:"dead,omitempty"`
+	Health         string           `json:"health,omitempty"` // ok|suspect|dead (v0.4 broker; empty on older)
 	ExpiresAt      int64            `json:"expiresAt"`
 	Usage          *anthropic.Usage `json:"usage,omitempty"`
 	OAuthAccount   map[string]any   `json:"oauthAccount,omitempty"`
@@ -506,6 +827,186 @@ func brokerGet(cfg *config.Agent, client *http.Client, path string) ([]byte, err
 		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return body, nil
+}
+
+// ---- watch daemon (C2) ----
+
+// runWatch is the foreground watch daemon: it long-polls the active credential
+// and runs a full sync on every change OR long-poll timeout, so a local /login
+// is offered within ≤~waitSec even with no broker-side change. Errors back off
+// 5s→60s jittered. A dedicated 90s client keeps the long-poll connection open.
+func runWatch(cfg *config.Agent, syncClient *http.Client) {
+	// Single-instance guard via an advisory lock held on the pidfile for the whole
+	// process lifetime (MAJOR-4): if another watcher holds the lock we exit,
+	// regardless of what stale pid the file contains. The lock is released only
+	// when this process dies (or on graceful shutdown below).
+	release, ok, err := acquireWatchLock(watchPidPath(cfg))
+	if err != nil {
+		logf("watch: lock error on %s: %v (proceeding without single-instance guard)", watchPidPath(cfg), err)
+	} else if !ok {
+		logf("watch already running (lock held); exiting")
+		return
+	} else {
+		defer release()
+	}
+
+	longClient, err := httpClientTimeout(cfg, 90*time.Second)
+	if err != nil {
+		fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	waitSec := cfg.WatchWaitSec
+	logf("watch started, waitSec=%d, targets=%d, policy=%s", waitSec, len(cfg.Targets), cfg.EffectivePolicy())
+	backoff := 5 * time.Second
+	var lastGen int64
+	for {
+		if ctx.Err() != nil {
+			logf("watch stopping")
+			return
+		}
+		name := watchCred(cfg)
+		if name == "" {
+			// No cred to long-poll yet (no @active); sync on the wait interval.
+			syncCycle(cfg, syncClient, false)
+			if sleepCtx(ctx, jitter(time.Duration(waitSec)*time.Second)) {
+				return
+			}
+			continue
+		}
+		gen, changed, err := longPoll(ctx, cfg, longClient, name, lastGen, waitSec)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logf("watch long-poll error: %v (backoff %s)", err, backoff)
+			if sleepCtx(ctx, jitter(backoff)) {
+				return
+			}
+			backoff *= 2
+			if backoff > 60*time.Second {
+				backoff = 60 * time.Second
+			}
+			continue
+		}
+		backoff = 5 * time.Second
+		progressed := gen > lastGen
+		if gen > lastGen {
+			lastGen = gen
+		}
+		syncCycle(cfg, syncClient, false)
+		// A "change" that did not advance the gen (e.g. a pre-v0.4 broker
+		// answering 200 immediately) would hot-loop; throttle it.
+		if changed && !progressed {
+			if sleepCtx(ctx, jitter(time.Duration(waitSec)*time.Second)) {
+				return
+			}
+		}
+	}
+}
+
+// longPoll issues one long-poll GET and maps the response: 200→(gen,true),
+// 304/409/503→(gen,false, no error, keep local), other→error (back off). The
+// current gen is read from the X-Ccb-Gen header so lastGen advances even past a
+// suspect-state 409, preventing a hot loop.
+func longPoll(ctx context.Context, cfg *config.Agent, client *http.Client, name string, sinceGen, waitSec int64) (int64, bool, error) {
+	path := fmt.Sprintf("%s/v1/credentials/%s?sinceGen=%d&waitSec=%d", cfg.BrokerURL, name, sinceGen, waitSec)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return sinceGen, false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return sinceGen, false, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	gen := sinceGen
+	if h := resp.Header.Get("X-Ccb-Gen"); h != "" {
+		if g, e := strconv.ParseInt(h, 10, 64); e == nil {
+			gen = g
+		}
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return gen, true, nil
+	case http.StatusNotModified, http.StatusConflict, http.StatusServiceUnavailable:
+		return gen, false, nil
+	default:
+		return sinceGen, false, fmt.Errorf("long-poll http %d", resp.StatusCode)
+	}
+}
+
+// watchCred returns the credential to long-poll: the first target that resolves
+// (following @active), or "" if none resolves yet.
+func watchCred(cfg *config.Agent) string {
+	for _, t := range cfg.Targets {
+		if n, err := resolveCred(cfg, t.Cred); err == nil {
+			return n
+		}
+	}
+	return ""
+}
+
+// ---- ensure-alive (cron watchdog for the watch daemon) ----
+
+// runEnsureAlive starts `ccb watch` if no live watch process holds the pidfile
+// lock — the */5 cron fallback on hosts without launchd/systemd (design C3).
+func runEnsureAlive(cfg *config.Agent, cfgPath string) error {
+	if watchLockHeld(watchPidPath(cfg)) {
+		return nil // a live watcher holds the lock
+	}
+	exe, err := resolveExe()
+	if err != nil {
+		return err
+	}
+	logPath := expandHome("~/.config/ccbroker/agent.log")
+	if err := startDetached(exe, expandHome(cfgPath), logPath); err != nil {
+		return err
+	}
+	logf("ensure-alive: started ccb watch")
+	return nil
+}
+
+func watchPidPath(cfg *config.Agent) string {
+	return filepath.Join(filepath.Dir(expandHome(cfg.ActiveFile)), "watch.pid")
+}
+
+// watchLockHeld reports whether a live watcher holds the pidfile lock. It probes
+// non-blocking: if it can acquire the lock (then immediately releases it) no
+// watcher is running; a failure to acquire means one is.
+func watchLockHeld(path string) bool {
+	release, ok, err := acquireWatchLock(path)
+	if err != nil {
+		return false // can't tell — let the caller try to (re)start
+	}
+	if ok {
+		release()
+		return false
+	}
+	return true
+}
+
+// sleepCtx sleeps for d or until ctx is cancelled; it returns true if cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+// jitter returns d plus a random 0..d/2 so reconnects don't synchronize.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int63n(int64(d)/2+1))
 }
 
 // ---- status rendering & cache ----
@@ -560,8 +1061,10 @@ func renderStatus(cfg *config.Agent, rows []usageRow) {
 		}
 		state := "ok"
 		switch {
-		case r.Dead:
+		case r.Dead || r.Health == "dead":
 			state = "DEAD (re-auth needed)"
+		case r.Health == "suspect":
+			state = "SUSPECT (revoked? recovering)"
 		case r.ExpiresAt <= now:
 			state = "token expired"
 		case r.UsageError != "":
@@ -1096,6 +1599,32 @@ func statuslineOff(settingsPath string) error {
 
 // ---- target writers ----
 
+// writeIfUnchanged re-reads the target and writes body only if the target's
+// current oauth still matches the snapshot the overwrite gate evaluated. If it
+// changed under us — especially a refresh token appearing from a concurrent
+// /login — the write is aborted so the next cycle re-evaluates (MAJOR-2 TOCTOU
+// guard). Returns (wrote, err); a read error aborts the write (never overwrite
+// on uncertainty).
+func writeIfUnchanged(t config.Target, snapshot map[string]any, body []byte) (bool, error) {
+	cur, err := readLocalOAuth(t)
+	if err != nil {
+		return false, err
+	}
+	if !sameOAuth(cur, snapshot) {
+		return false, nil
+	}
+	return true, writeTarget(t, body)
+}
+
+// sameOAuth reports whether two oauth snapshots carry the same access and
+// refresh tokens (nil compares equal to an empty/absent token). It is the
+// security-relevant equality: a differing or newly-present refresh token means a
+// fresh lineage landed and must not be clobbered.
+func sameOAuth(a, b map[string]any) bool {
+	return oauthStr(a, "accessToken") == oauthStr(b, "accessToken") &&
+		oauthStr(a, "refreshToken") == oauthStr(b, "refreshToken")
+}
+
 func writeTarget(t config.Target, body []byte) error {
 	switch t.Type {
 	case "file":
@@ -1192,7 +1721,15 @@ func keychainAccount() string {
 
 // ---- plumbing ----
 
+// httpClient builds the standard 30s request client.
 func httpClient(cfg *config.Agent) (*http.Client, error) {
+	return httpClientTimeout(cfg, 30*time.Second)
+}
+
+// httpClientTimeout builds a broker client with the given overall request
+// budget, reusing the same TLS/proxy configuration. `ccb watch` uses a longer
+// (90s) budget so a long-poll can hold the connection open.
+func httpClientTimeout(cfg *config.Agent, timeout time.Duration) (*http.Client, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if cfg.Insecure {
 		tlsCfg.InsecureSkipVerify = true
@@ -1232,10 +1769,10 @@ func httpClient(cfg *config.Agent) (*http.Client, error) {
 		proxy = http.ProxyURL(u)
 	}
 	// Short dial + TLS-handshake timeouts so an unreachable broker fails in ~5s
-	// instead of blocking the whole 30s request budget; the 30s Client.Timeout
-	// still caps a slow-but-responding broker.
+	// instead of blocking the whole request budget; the Client.Timeout still caps
+	// a slow-but-responding broker.
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: timeout,
 		Transport: &http.Transport{
 			Proxy:               proxy,
 			TLSClientConfig:     tlsCfg,

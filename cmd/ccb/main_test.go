@@ -74,6 +74,28 @@ func TestAutoSelectPolicy(t *testing.T) {
 	}
 }
 
+func TestRenderStatusShowsHealth(t *testing.T) {
+	dir := t.TempDir()
+	active := filepath.Join(dir, "active")
+	if err := writeActive(active, "okk"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Agent{ActiveFile: active, AutoThreshold: 0.95}
+	future := time.Now().UnixMilli() + 3_600_000
+	rows := []usageRow{
+		{Name: "sus", Health: "suspect", ExpiresAt: future},
+		{Name: "ded", Health: "dead", ExpiresAt: future},
+		{Name: "okk", Health: "ok", ExpiresAt: future},
+	}
+	out := captureStdout(t, func() { renderStatus(cfg, rows) })
+	if !strings.Contains(out, "SUSPECT") {
+		t.Errorf("ccb status should surface SUSPECT health:\n%s", out)
+	}
+	if !strings.Contains(out, "DEAD") {
+		t.Errorf("ccb status should surface DEAD health:\n%s", out)
+	}
+}
+
 func TestRunPolicySet(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "agent.json")
 	orig := `{

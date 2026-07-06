@@ -141,8 +141,10 @@ a `refreshToken` is required. From then on the broker refreshes it.
 ## Run the client (`ccb`)
 
 ```sh
-ccb setup         # interactive first-run wizard: writes agent.json, offers a scheduler
-ccb pull          # one-shot sync (default config: ~/.config/ccbroker/agent.json)
+ccb setup         # interactive first-run wizard: writes agent.json, installs the watch daemon
+ccb sync          # one-shot sync (offer local /login, adopt, write active) — `pull` is a kept alias
+ccb watch         # foreground daemon: long-poll the broker and sync on every rotation
+ccb ensure-alive  # start `ccb watch` if it is not running (cron fallback)
 ccb run           # loop on intervalSec
 ccb use work      # switch the "@active" account and sync
 ccb auto          # switch to the least-utilized account and sync
@@ -274,7 +276,7 @@ ccb statusline --install --settings ~/.claude-work/settings.json
 `claude-plugin/` is a minimal Claude Code plugin exposing `/ccb-status`,
 `/ccb-use <name>`, `/ccb-auto`, `/ccb-policy [manual|account|all]` and
 `/ccbroker:statusline [on|off]` as slash commands plus a SessionStart hook that
-runs `ccb pull` (fresh token + fresh quota cache at session start). It requires
+runs `ccb sync` (fresh token + fresh quota cache at session start). It requires
 `ccb` on PATH. Claude Code does not render statuslines from a plugin, so
 `/ccbroker:statusline` just shells out to `ccb statusline on|off` to wire the
 line into your `settings.json`.
@@ -349,16 +351,90 @@ Keep the admin API off the proxy — it stays localhost-only on the broker host.
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
 | GET | `/healthz` | none | liveness |
-| GET | `/v1/credentials/{name}` | `Authorization: Bearer <token>` + scope | current `.credentials.json` for `name` |
+| GET | `/v1/credentials/{name}` | `Authorization: Bearer <token>` + scope | current credential for `name` (refresh token stripped) + `{gen, account}` envelope; `?probe=1` adds a fresh `probeLive`; `?sinceGen=G&waitSec=W` long-polls (`304` on timeout) |
+| POST | `/v1/creds/offer` | `Authorization: Bearer <token>` | offer a local `/login` credential for account-routed adoption |
 | GET | `/v1/usage` | `Authorization: Bearer <token>` | quota snapshots for all creds in scope (no tokens) |
-| PUT | `/admin/creds/{name}` | `X-Admin-Token` (localhost) | import/replace a credential |
+| PUT | `/admin/creds/{name}` | `X-Admin-Token` (localhost) | import/replace a credential (verifies live + records account) |
 | GET | `/admin/creds` | `X-Admin-Token` (localhost) | list (redacted) |
 | DELETE | `/admin/creds/{name}` | `X-Admin-Token` (localhost) | remove |
 | POST | `/admin/creds/{name}/refresh` | `X-Admin-Token` (localhost) | force refresh now |
 
-The credential endpoint never returns an already-expired token (a client that
-received one would refresh it itself and rotate the broker's refresh token out
-from under it); it returns `503` instead so the client keeps its last good copy.
+The credential endpoint strips the refresh token before serving (unless
+`serveRefreshToken` is set during the rollout window — see
+[Upgrading to v0.4.0](#upgrading-to-v040-refresh-token-quarantine)). It never
+returns an already-expired token; it serves `409` for a `suspect`/`dead`
+credential and `503` for an expired one, so the client keeps its last good copy.
+
+## Upgrading to v0.4.0 (refresh-token quarantine)
+
+v0.4.0 closes the multi-refresher logout class: two machines sharing one OAuth
+lineage could each legally refresh (any copy whose token is expired-per-clock
+refreshes per Claude Code's own rules), revoking the broker's generation and, on
+a replay of a superseded refresh token, killing the lineage. The fix makes the
+broker the **single writer** of the refresh chain.
+
+**What changes**
+
+* **Refresh-token quarantine (invariant I1).** Refresh tokens now live *only* in
+  the broker store. The broker strips the `refreshToken` when it serves a
+  credential, and the client strips it again on every write — so no client disk
+  ever holds a refresh token in the steady state, and no client can refresh
+  (Claude Code with a refresh-token-less credential simply never refreshes; it
+  recovers when the broker updates the token). The one transient exception is a
+  machine that just ran `/login`: it holds the new lineage's refresh token until
+  `ccb sync` **offers** it upstream — and that token is never destroyed locally
+  until the broker provably holds a live, same-account credential.
+* **Account-routed offer/adopt.** `ccb sync` (and `ccb use`, and the SessionStart
+  hook) offer any local `/login` credential to `POST /v1/creds/offer`. The broker
+  verifies the token is live, routes it to the matching credential **by account**
+  (not by name), checks an anti-rollback ring, and adopts it. A fresh `/login`
+  therefore enters the system through the front door instead of clobbering a
+  managed credential.
+* **Health lifecycle.** An access token that returns a confirmed 401/403-revoked
+  while still unexpired marks the credential `suspect`; the broker serves `409`
+  (so it stops handing out a revoked token within ~5 min instead of ~3 h) and
+  does **not** immediately replay the refresh token. Recovery is either an
+  incoming `/login` offer or, after 10 min with no offer, a single last-resort
+  reclaim refresh. A `dead` credential is re-probed every 30 min and self-heals
+  on a 200.
+* **`ccb sync`** is the new name for `ccb pull` (the old name still works). The
+  overwrite gate never destroys a local refresh token on any failure path
+  (broker down, old broker, rate limit, verify outage, clock skew): the worst
+  case keeps the local credential and retries next cycle.
+
+**Rollout order — do this exactly (matches design §5)**
+
+1. Release and deploy the **broker** with `"serveRefreshToken": true` in
+   `config.json`. This keeps full backward compatibility: pre-v0.4 clients still
+   receive a refresh token and self-heal; nothing is quarantined yet.
+2. Upgrade **all** clients to v0.4.0 and convert their schedulers to the watch
+   daemon (`ccb setup` re-run, or install `ccb watch`). Verify the offer path
+   with a real `/login`, and that the overwrite gate keeps the local credential
+   on a rejected offer.
+   * **N-7 warning:** during this window, do **not** run `/login` on a machine
+     that has not yet been upgraded — its old one-way `pull` will still clobber a
+     fresh login. Keep the window short.
+3. Flip the broker to `"serveRefreshToken": false` and run `ccb sync` once
+   everywhere. Fleet disks lose their refresh tokens and the quarantine is
+   active.
+
+**Watch daemon is required (M-6).** Quarantine means only the broker refreshes,
+so every rotation must reach each machine promptly. `ccb setup` installs a
+**watch daemon** by default (launchd `KeepAlive` on macOS, a systemd-user service
+with `Restart=always` on Linux, or a `*/5 ensure-alive` cron wrapper elsewhere),
+which long-polls the broker and syncs within seconds of a rotation. It **also**
+installs a periodic `ccb sync` watchdog: if the daemon dies, any outage is
+bounded to one sync interval per rotation (default 30 min) rather than being
+open-ended. On a Linux box that should keep syncing while logged out, run
+`sudo loginctl enable-linger $USER`.
+
+**Unknown accounts.** If `ccb sync` finds a local credential for an account the
+broker does not manage **at all**, it does not touch it — it keeps the local
+credential and warns loudly: that account is a multi-refresher hazard sitting
+unmanaged on disk. Either log out of it, or import it into the broker
+(`PUT /admin/creds/{name}`) so the broker becomes its single refresher. Note the
+v0.4.0 import verifies the token live and records the account before storing, so
+import requires the profile endpoint to be reachable.
 
 ## Caveats
 

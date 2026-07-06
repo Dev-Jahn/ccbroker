@@ -273,8 +273,9 @@ func TestOfferDecisionTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// not-live: an unknown/dead access token.
-	_, res := doOffer(srv, tok1, oauthBody("dead-token", "rt-x", srv.now()+farFuture))
+	// not-live: an unknown/dead access token issued long enough ago that the
+	// fresh_unverified transient window (v0.4.1) does not apply.
+	_, res := doOffer(srv, tok1, oauthBody("dead-token", "rt-x", srv.now()+farFuture-3_600_000))
 	if res.Reason != "offer_not_live" {
 		t.Errorf("dead token: reason=%q want offer_not_live", res.Reason)
 	}
@@ -828,5 +829,68 @@ func TestConcurrentOfferAndRefresh(t *testing.T) {
 	}
 	if rec, _ := srv.store.Get("a"); rec.RefreshToken() == "" {
 		t.Errorf("cred lost its refresh token under concurrency")
+	}
+}
+
+// ---- fresh_unverified classification (v0.4.1) ----
+// Measured 2026-07-06: /api/oauth/profile can 401 for minutes after a token is
+// issued while inference already accepts it. A fresh token failing profile with
+// 401 must be classified retryable, not definitive, or the client's overwrite
+// gate could discard a genuinely fresh /login RT.
+
+func TestOauthApparentAge(t *testing.T) {
+	now := time.Now().UnixMilli()
+	cases := []struct {
+		name   string
+		exp    int64
+		wantOK bool
+		maxAge time.Duration
+	}{
+		{"just issued", now + farFuture, true, time.Minute},
+		{"issued 1h ago", now + farFuture - 3_600_000, true, 61 * time.Minute},
+		{"missing", 0, false, 0},
+		{"absurd future (age negative)", now + farFuture + 3_600_000, false, 0},
+		{"ancient (age > 9h)", now - 7_200_000, false, 0},
+	}
+	for _, c := range cases {
+		age, ok := oauthApparentAge(oauthBody("a", "r", c.exp), now)
+		if ok != c.wantOK {
+			t.Errorf("%s: ok=%v want %v", c.name, ok, c.wantOK)
+			continue
+		}
+		if ok && (age < 0 || age > c.maxAge) {
+			t.Errorf("%s: age=%v out of expected range", c.name, age)
+		}
+	}
+}
+
+func TestOfferFreshUnverified(t *testing.T) {
+	f := newFake("rotating")
+	f.use(t)
+	f.addAccess("acc-p0", "p@x", "uuid-p")
+	srv, _ := newServer(t, newStore(t))
+	srv.offerRate = 100
+	putCred(t, srv, "personal", "p@x", "uuid-p", "acc-p0", "rt-p0", srv.now()+farFuture)
+	if err := srv.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A dead-per-profile token that LOOKS freshly issued -> retryable.
+	_, res := doOffer(srv, tok1, oauthBody("lagging-fresh", "rt-f", srv.now()+farFuture))
+	if res.Reason != "fresh_unverified" {
+		t.Errorf("fresh dead token: reason=%q want fresh_unverified", res.Reason)
+	}
+	// Just past the window -> definitive offer_not_live.
+	past := srv.now() + farFuture - (16 * time.Minute).Milliseconds()
+	_, res = doOffer(srv, tok1, oauthBody("lagging-old", "rt-o", past))
+	if res.Reason != "offer_not_live" {
+		t.Errorf("16min-old dead token: reason=%q want offer_not_live", res.Reason)
+	}
+	// Uncomputable age (no expiresAt) -> definitive.
+	body := oauthBody("no-exp", "rt-n", 0)
+	delete(body, "expiresAt")
+	_, res = doOffer(srv, tok1, body)
+	if res.Reason != "offer_not_live" {
+		t.Errorf("no-expiresAt dead token: reason=%q want offer_not_live", res.Reason)
 	}
 }

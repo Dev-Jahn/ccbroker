@@ -43,6 +43,9 @@ func TestOverwriteDecision(t *testing.T) {
 		{"rate_limited keeps", true, false, "rate_limited", false, false},
 		{"old_broker(404) keeps", true, false, "old_broker", false, false},
 		{"offer_error keeps", true, false, "offer_error", false, false},
+		// v0.4.1: profile lag on freshly issued tokens — must keep local even
+		// with probeLive true (default-deny covers unknown reasons; assert it).
+		{"fresh_unverified keeps (even if probe true)", true, false, "fresh_unverified", true, false},
 	}
 	for _, c := range cases {
 		if got := overwriteDecision(c.hasRT, c.adopted, c.reason, c.probeLive); got != c.want {

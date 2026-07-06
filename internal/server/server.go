@@ -842,6 +842,29 @@ func (s *Server) handleGetCred(w http.ResponseWriter, r *http.Request) {
 		name, client.Name, ip, snap.Gen, snap.ExpiresAtMs(), probe)
 }
 
+// freshUnverifiedWindow is how long after apparent issuance a profile 401/403
+// on an offered token is treated as transient rather than definitive. Measured
+// 2026-07-06: /api/oauth/profile returned 401 for several minutes after a token
+// was issued (propagation lag) while /v1/messages already accepted it.
+const freshUnverifiedWindow = 15 * time.Minute
+
+// oauthApparentAge estimates how long ago the offered token was issued, using
+// the standard 8h access-token lifetime (expires_in has been a constant 28800s).
+// ok=false when the age cannot be computed sensibly (missing/absurd expiresAt);
+// callers must then fall back to the definitive classification.
+func oauthApparentAge(oauth map[string]any, nowMs int64) (time.Duration, bool) {
+	rec := creds.Record{OAuth: oauth}
+	exp := rec.ExpiresAtMs()
+	if exp <= 0 {
+		return 0, false
+	}
+	age := time.Duration(nowMs-(exp-(8*time.Hour).Milliseconds())) * time.Millisecond
+	if age < 0 || age > 9*time.Hour {
+		return 0, false
+	}
+	return age, true
+}
+
 // handleOffer is the account-routed offer/adopt endpoint (S2). The client hands
 // in a full credential (WITH refresh token) from a fresh /login; the broker
 // verifies liveness, routes by account, checks anti-rollback, and adopts.
@@ -890,6 +913,17 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 		cancel()
 		if perr != nil {
 			if anthropic.AuthFailure(perr) {
+				// A freshly issued token can 401 on profile for minutes after
+				// issuance while inference already accepts it. offer_not_live is
+				// definitive to the client's overwrite gate, so a fresh token gets
+				// a retryable classification instead (clients keep local and
+				// re-offer next cycle; a genuinely dead-but-fresh-looking token
+				// converges to offer_not_live once the window passes).
+				if age, ok := oauthApparentAge(oauth, s.now()); ok && age < freshUnverifiedWindow {
+					s.audit.Printf("OFFER client=%s ip=%s result=fresh_unverified age=%s", client.Name, ip, age.Round(time.Second))
+					respond(false, "", "fresh_unverified", "", 0)
+					return
+				}
 				s.audit.Printf("OFFER client=%s ip=%s result=offer_not_live", client.Name, ip)
 				respond(false, "", "offer_not_live", "", 0)
 				return

@@ -82,7 +82,7 @@ jobs:
           mv .claude-plugin/marketplace.json.new .claude-plugin/marketplace.json
 
           git config user.name 'ccbroker-publish-bot'
-          git config user.email 'ccbroker-publish-bot@users.noreply.github.com'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
           if [[ -z "$(git status --porcelain)" ]]; then
             echo "marketplace already pins ccbroker at v${VERSION} @ ${GITHUB_SHA}; no-op"

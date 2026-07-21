@@ -155,7 +155,7 @@ func main() {
 			os.Exit(1)
 		}
 	case "watch":
-		runWatch(cfg, client)
+		runWatch(cfg, client, cfgPath)
 	case "ensure-alive":
 		if err := runEnsureAlive(cfg, cfgPath); err != nil {
 			fatal(err)
@@ -835,7 +835,7 @@ func brokerGet(cfg *config.Agent, client *http.Client, path string) ([]byte, err
 // and runs a full sync on every change OR long-poll timeout, so a local /login
 // is offered within ≤~waitSec even with no broker-side change. Errors back off
 // 5s→60s jittered. A dedicated 90s client keeps the long-poll connection open.
-func runWatch(cfg *config.Agent, syncClient *http.Client) {
+func runWatch(cfg *config.Agent, syncClient *http.Client, cfgPath string) {
 	// Single-instance guard via an advisory lock held on the pidfile for the whole
 	// process lifetime (MAJOR-4): if another watcher holds the lock we exit,
 	// regardless of what stale pid the file contains. The lock is released only
@@ -857,8 +857,7 @@ func runWatch(cfg *config.Agent, syncClient *http.Client) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	waitSec := cfg.WatchWaitSec
-	logf("watch started, waitSec=%d, targets=%d, policy=%s", waitSec, len(cfg.Targets), cfg.EffectivePolicy())
+	logf("watch started, waitSec=%d, targets=%d, policy=%s", cfg.WatchWaitSec, len(cfg.Targets), cfg.EffectivePolicy())
 	backoff := 5 * time.Second
 	var lastGen int64
 	for {
@@ -866,6 +865,19 @@ func runWatch(cfg *config.Agent, syncClient *http.Client) {
 			logf("watch stopping")
 			return
 		}
+		// Hot-reload the config each iteration so `ccb policy`, autoThreshold, or
+		// target edits apply without restarting the daemon. Transport-level fields
+		// (brokerUrl host, proxyUrl, mTLS certs) are bound to the HTTP clients built
+		// above and still need a restart. A read/parse error keeps the last-good cfg.
+		if fresh, lerr := config.LoadAgent(cfgPath); lerr != nil {
+			logf("watch: config reload failed, keeping previous: %v", lerr)
+		} else {
+			if fresh.EffectivePolicy() != cfg.EffectivePolicy() {
+				logf("watch: policy %s -> %s (config reloaded)", cfg.EffectivePolicy(), fresh.EffectivePolicy())
+			}
+			cfg = fresh
+		}
+		waitSec := cfg.WatchWaitSec
 		name := watchCred(cfg)
 		if name == "" {
 			// No cred to long-poll yet (no @active); sync on the wait interval.

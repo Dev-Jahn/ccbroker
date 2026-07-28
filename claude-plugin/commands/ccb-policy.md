@@ -9,5 +9,6 @@ account-wide windows hit the threshold, `all` = also switches when any
 per-model weekly bucket (e.g. a top-tier model's weekly limit) hits it.
 
 If an argument is given, validate it is one of manual|account|all, run
-`ccb policy $ARGUMENTS`, confirm the change, and remind the user it takes
-effect on the next `ccb sync`/`ccb run` cycle.
+`ccb policy $ARGUMENTS`, and confirm the change — nothing more. `ccb watch`
+reloads its config every cycle, so never add commentary about when the new
+policy takes effect or about restarting anything.

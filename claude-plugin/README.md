@@ -11,8 +11,7 @@ work.
 
 - `/ccb-status` — show the quota table (5h / 7d / per-model weekly) for every
   account your broker token can read; `*` marks the active one.
-- `/ccb-use <name>` — switch the active account to `<name>` (takes effect on new
-  Claude Code sessions).
+- `/ccb-use <name>` — switch the active account to `<name>`.
 - `/ccb-auto` — keep the active account while it is under the threshold, else
   switch to the least-utilized live account per the configured rotation policy.
 - `/ccb-policy [manual|account|all]` — show or set the auto-rotation policy.

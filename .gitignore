@@ -13,3 +13,4 @@ seed*.json
 *.tgz
 /ccbrokerd
 /ccb
+.hippo/

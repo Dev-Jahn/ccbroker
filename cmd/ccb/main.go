@@ -1161,7 +1161,7 @@ const (
 	slHIGH = "\x1b[38;5;210m"           // utilization >= 80% (and the dead ✗)
 	slMID  = "\x1b[38;5;221m"           // utilization >= 50%
 	slLOW  = "\x1b[38;5;114m"           // utilization < 50%
-	slREM  = "\x1b[38;5;244m"           // 7d reset countdown (↻)
+	slREM  = "\x1b[38;5;244m"           // reset countdown (↻)
 )
 
 // printStatuslineAll renders the full multi-account usage line (see
@@ -1183,13 +1183,17 @@ func printStatuslineAll(cfg *config.Agent) {
 }
 
 // renderStatuslineAll builds the full one-line status from a cache snapshot:
-// every credential in cache order joined by SEP, the active one marked ⛁ and
-// bright, dead ones prefixed ✗, each followed by 5h/7d and per-model weekly
-// utilization segments. Pure (no I/O) so it is testable; nowMs drives the
-// " ~stale" suffix.
+// the active credential first (marked ⛁ and bright), then the rest ordered by
+// how much quota they have left (see statuslineOrder), joined by SEP, dead ones
+// prefixed ✗. Each credential shows its 5h/7d and per-model weekly segments,
+// collapsed to just the spent windows when any of them is maxed (see
+// statuslineCollapse), followed by a ↻ countdown to the reset that matters for
+// what is shown (see statuslineReset). Pure (no I/O) so it is testable; nowMs
+// drives the countdowns and the " ~stale" suffix.
 func renderStatuslineAll(active string, cache statusCache, nowMs int64) string {
-	parts := make([]string, 0, len(cache.Credentials))
-	for _, r := range cache.Credentials {
+	rows := statuslineOrder(cache.Credentials, active)
+	parts := make([]string, 0, len(rows))
+	for _, r := range rows {
 		var b strings.Builder
 		if r.Dead {
 			b.WriteString(slHIGH + "✗ " + slRST)
@@ -1199,14 +1203,12 @@ func renderStatuslineAll(active string, cache statusCache, nowMs int64) string {
 		} else {
 			b.WriteString(slDIM + r.Name + slRST)
 		}
-		for _, seg := range statuslineSegments(r.Usage) {
-			b.WriteString(" " + seg)
+		segs, collapsed := statuslineCollapse(statuslineSegments(r.Usage))
+		for _, seg := range segs {
+			b.WriteString(" " + seg.text)
 		}
-		// Only the seven-day window gets a reset countdown: it is the
-		// long-cycle constraint worth tracking, whereas the fast 5h cycle is
-		// already legible from how far its percentage has climbed.
-		if r.Usage != nil && r.Usage.SevenDay != nil && r.Usage.SevenDay.ResetsAt > nowMs {
-			b.WriteString(" " + slREM + "↻" + fmtRemain((r.Usage.SevenDay.ResetsAt-nowMs)/1000) + slRST)
+		if reset := statuslineReset(r.Usage, segs, collapsed, nowMs); reset > 0 {
+			b.WriteString(" " + slREM + "↻" + fmtRemain((reset-nowMs)/1000) + slRST)
 		}
 		parts = append(parts, b.String())
 	}
@@ -1217,19 +1219,85 @@ func renderStatuslineAll(active string, cache statusCache, nowMs int64) string {
 	return line
 }
 
+// statuslineOrder returns the credentials in display order without mutating the
+// caller's slice: the active one leftmost (even when dead), then the live ones
+// least-used first so the best account to switch to sits next to the active
+// one, then the unusable ones (dead or no usage) last. See statuslineLess.
+func statuslineOrder(rows []usageRow, active string) []usageRow {
+	head := make([]usageRow, 0, 1)
+	rest := make([]usageRow, 0, len(rows))
+	for _, r := range rows {
+		if active != "" && len(head) == 0 && r.Name == active {
+			head = append(head, r)
+			continue
+		}
+		rest = append(rest, r)
+	}
+	sort.Slice(rest, func(i, j int) bool { return statuslineLess(rest[i], rest[j]) })
+	return append(head, rest...)
+}
+
+// statuslineLess orders two credentials by remaining quota, least used first.
+// The key is the per-model weekly utilization (the highest bucket, i.e. the
+// most constrained model), then the account-wide 7d then 5h windows, then the
+// name so the order is deterministic. A dead credential or one with no usage
+// data cannot be switched to, so it sorts after every live one.
+func statuslineLess(a, b usageRow) bool {
+	au, bu := a.Usage != nil && !a.Dead, b.Usage != nil && !b.Dead
+	if au != bu {
+		return au
+	}
+	if !au {
+		return a.Name < b.Name
+	}
+	ka, kb := statuslineSortKey(a.Usage), statuslineSortKey(b.Usage)
+	for i := range ka {
+		if ka[i] != kb[i] {
+			return ka[i] < kb[i]
+		}
+	}
+	return a.Name < b.Name
+}
+
+// statuslineSortKey is the ascending sort key of one credential: highest
+// per-model weekly utilization, then 7d, then 5h. Missing windows count as 0.
+func statuslineSortKey(u *anthropic.Usage) [3]float64 {
+	var k [3]float64
+	for _, b := range u.ScopedWeekly {
+		if b.Utilization > k[0] {
+			k[0] = b.Utilization
+		}
+	}
+	if u.SevenDay != nil {
+		k[1] = u.SevenDay.Utilization
+	}
+	if u.FiveHour != nil {
+		k[2] = u.FiveHour.Utilization
+	}
+	return k
+}
+
+// slSeg is one rendered usage segment plus what the line needs to decide which
+// segments to keep and which reset to count down to.
+type slSeg struct {
+	text     string // rendered "<label><pct>%", colored
+	pct      int    // the displayed percentage, i.e. what the reader sees
+	resetsAt int64  // unix ms this window resets, 0 if unknown
+}
+
 // statuslineSegments renders the "5h:", "7d:" and per-model weekly segments for
 // one credential, in that order; weekly buckets are sorted by model display
 // name. A nil Usage yields no segments.
-func statuslineSegments(u *anthropic.Usage) []string {
+func statuslineSegments(u *anthropic.Usage) []slSeg {
 	if u == nil {
 		return nil
 	}
-	var segs []string
+	var segs []slSeg
 	if u.FiveHour != nil {
-		segs = append(segs, statuslineSegment("5h:", u.FiveHour.Utilization))
+		segs = append(segs, statuslineSegment("5h:", *u.FiveHour))
 	}
 	if u.SevenDay != nil {
-		segs = append(segs, statuslineSegment("7d:", u.SevenDay.Utilization))
+		segs = append(segs, statuslineSegment("7d:", *u.SevenDay))
 	}
 	models := make([]string, 0, len(u.ScopedWeekly))
 	for m := range u.ScopedWeekly {
@@ -1237,15 +1305,15 @@ func statuslineSegments(u *anthropic.Usage) []string {
 	}
 	sort.Strings(models)
 	for _, m := range models {
-		segs = append(segs, statuslineSegment(modelLabel(m), u.ScopedWeekly[m].Utilization))
+		segs = append(segs, statuslineSegment(modelLabel(m), u.ScopedWeekly[m]))
 	}
 	return segs
 }
 
 // statuslineSegment formats one "<label><pct>%" segment: label in DIM, the
 // percentage colored by utilization (>=80 HIGH, >=50 MID, else LOW).
-func statuslineSegment(label string, util float64) string {
-	p := int(math.Round(util * 100))
+func statuslineSegment(label string, b anthropic.Bucket) slSeg {
+	p := int(math.Round(b.Utilization * 100))
 	color := slLOW
 	switch {
 	case p >= 80:
@@ -1253,7 +1321,53 @@ func statuslineSegment(label string, util float64) string {
 	case p >= 50:
 		color = slMID
 	}
-	return slDIM + label + color + fmt.Sprintf("%d%%", p) + slRST
+	return slSeg{
+		text:     slDIM + label + color + fmt.Sprintf("%d%%", p) + slRST,
+		pct:      p,
+		resetsAt: b.ResetsAt,
+	}
+}
+
+// statuslineCollapse trims a credential's segments to what is actually blocking
+// it: once any window displays 100% or more, the others say nothing the reader
+// can act on, so only the spent ones are kept (in their original order) and the
+// second return value reports that the collapse happened. Nothing maxed out
+// means everything is shown. The test is the displayed (rounded) percentage, so
+// a window shown as "100%" always collapses the chunk, however it rounded.
+func statuslineCollapse(segs []slSeg) ([]slSeg, bool) {
+	maxed := make([]slSeg, 0, len(segs))
+	for _, s := range segs {
+		if s.pct >= 100 {
+			maxed = append(maxed, s)
+		}
+	}
+	if len(maxed) == 0 {
+		return segs, false
+	}
+	return maxed, true
+}
+
+// statuslineReset returns the unix-ms reset the ↻ countdown should track, or 0
+// for no countdown. A collapsed chunk counts down to the earliest of the spent
+// windows it kept — that is when the account becomes usable again, and showing
+// a seven-day countdown next to a maxed 5h window would badly overstate the
+// wait. An uncollapsed chunk counts down the seven-day window: it is the
+// long-cycle constraint worth tracking, whereas the fast 5h cycle is already
+// legible from how far its percentage has climbed.
+func statuslineReset(u *anthropic.Usage, segs []slSeg, collapsed bool, nowMs int64) int64 {
+	if collapsed {
+		best := int64(0)
+		for _, s := range segs {
+			if s.resetsAt > nowMs && (best == 0 || s.resetsAt < best) {
+				best = s.resetsAt
+			}
+		}
+		return best
+	}
+	if u != nil && u.SevenDay != nil && u.SevenDay.ResetsAt > nowMs {
+		return u.SevenDay.ResetsAt
+	}
+	return 0
 }
 
 // fmtRemain renders a seconds duration as a compact reset countdown: "XdYh"

@@ -169,7 +169,7 @@ func TestRenderStatuslineAll(t *testing.T) {
 				// SevenDay resets 2h35m ahead → "↻2h35m".
 				SevenDay: &anthropic.Bucket{Utilization: 0.71, ResetsAt: nowMs + 9_300_000}, // 71% → MID
 				ScopedWeekly: map[string]anthropic.Bucket{
-					"Fable":  {Utilization: 1.37}, // 137% overage → HIGH
+					"Fable":  {Utilization: 0.87}, // 87% → HIGH
 					"Sonnet": {Utilization: 0.05}, // 5% → LOW
 				},
 			}},
@@ -180,12 +180,20 @@ func TestRenderStatuslineAll(t *testing.T) {
 			{Name: "charlie", Dead: true},
 		},
 	}
+	orig := append([]usageRow(nil), cache.Credentials...)
 	line := renderStatuslineAll("bravo", cache, nowMs)
 
-	// Names present in cache order.
+	// Active first, then the live account, then the dead one — regardless of
+	// cache order (alpha comes first in the cache).
 	ia, ib, ic := strings.Index(line, "alpha"), strings.Index(line, "bravo"), strings.Index(line, "charlie")
-	if ia < 0 || ib < 0 || ic < 0 || !(ia < ib && ib < ic) {
+	if ia < 0 || ib < 0 || ic < 0 || !(ib < ia && ia < ic) {
 		t.Fatalf("names missing or out of order (alpha=%d bravo=%d charlie=%d):\n%q", ia, ib, ic, line)
+	}
+	// The caller's slice must not be reordered.
+	for i := range orig {
+		if cache.Credentials[i].Name != orig[i].Name {
+			t.Fatalf("cache.Credentials reordered: %v", cache.Credentials)
+		}
 	}
 	// ⛁ marks the active account only; ✗ marks the dead one only.
 	if n := strings.Count(line, "⛁"); n != 1 {
@@ -217,8 +225,8 @@ func TestRenderStatuslineAll(t *testing.T) {
 	if !strings.Contains(line, slMID+"71%") {
 		t.Errorf("MID color for 71%% missing:\n%q", line)
 	}
-	if !strings.Contains(line, slHIGH+"137%") {
-		t.Errorf("HIGH color for 137%% missing:\n%q", line)
+	if !strings.Contains(line, slHIGH+"87%") {
+		t.Errorf("HIGH color for 87%% missing:\n%q", line)
 	}
 	// Separators between the three creds.
 	if n := strings.Count(line, slSEP); n != 2 {
@@ -241,6 +249,188 @@ func TestRenderStatuslineAll(t *testing.T) {
 	fresh := statusCache{FetchedAt: nowMs, Credentials: cache.Credentials}
 	if strings.Contains(renderStatuslineAll("bravo", fresh, nowMs), "~stale") {
 		t.Errorf("fresh cache should not be marked ~stale")
+	}
+}
+
+// slRow builds a live usageRow with the given 5h and 7d utilizations plus one
+// weekly bucket per extra utilization ("Model0", "Model1", ...).
+func slRow(name string, five, seven float64, weekly ...float64) usageRow {
+	u := &anthropic.Usage{
+		FiveHour: &anthropic.Bucket{Utilization: five},
+		SevenDay: &anthropic.Bucket{Utilization: seven},
+	}
+	for i, w := range weekly {
+		if u.ScopedWeekly == nil {
+			u.ScopedWeekly = map[string]anthropic.Bucket{}
+		}
+		u.ScopedWeekly[fmt.Sprintf("Model%d", i)] = anthropic.Bucket{Utilization: w}
+	}
+	return usageRow{Name: name, Usage: u}
+}
+
+func TestStatuslineOrder(t *testing.T) {
+	dead := usageRow{Name: "dd", Dead: true, Usage: &anthropic.Usage{
+		FiveHour: &anthropic.Bucket{Utilization: 0.01}, // low usage must not save it
+	}}
+	noUsage := usageRow{Name: "nu"}
+	cases := []struct {
+		name   string
+		active string
+		rows   []usageRow
+		want   []string
+	}{
+		{
+			name: "weekly utilization outranks 7d and 5h",
+			rows: []usageRow{slRow("weekly-hot", 0, 0, 0.9), slRow("account-hot", 0.99, 0.99, 0.1)},
+			want: []string{"account-hot", "weekly-hot"},
+		},
+		{
+			name: "the most constrained weekly bucket is the one compared",
+			rows: []usageRow{slRow("a", 0, 0, 0.1, 0.8), slRow("b", 0, 0, 0.5, 0.5)},
+			want: []string{"b", "a"},
+		},
+		{
+			name: "no weekly buckets counts as 0",
+			rows: []usageRow{slRow("has-weekly", 0, 0, 0.2), slRow("no-weekly", 0, 0.9)},
+			want: []string{"no-weekly", "has-weekly"},
+		},
+		{
+			name: "7d breaks a weekly tie",
+			rows: []usageRow{slRow("a", 0.9, 0.4, 0.5), slRow("b", 0.1, 0.3, 0.5)},
+			want: []string{"b", "a"},
+		},
+		{
+			name: "5h breaks a weekly+7d tie",
+			rows: []usageRow{slRow("a", 0.6, 0.3, 0.5), slRow("b", 0.2, 0.3, 0.5)},
+			want: []string{"b", "a"},
+		},
+		{
+			name: "name breaks a full tie",
+			rows: []usageRow{slRow("zeta", 0.2, 0.3, 0.5), slRow("alpha", 0.2, 0.3, 0.5)},
+			want: []string{"alpha", "zeta"},
+		},
+		{
+			name: "dead and usage-less sort last, by name",
+			rows: []usageRow{noUsage, dead, slRow("busy", 0.99, 0.99, 0.99)},
+			want: []string{"busy", "dd", "nu"},
+		},
+		{
+			name:   "active is leftmost regardless of usage",
+			active: "busy",
+			rows:   []usageRow{slRow("idle", 0, 0, 0), slRow("busy", 0.9, 0.9, 0.9)},
+			want:   []string{"busy", "idle"},
+		},
+		{
+			name:   "active goes first even when dead",
+			active: "dd",
+			rows:   []usageRow{slRow("idle", 0, 0, 0), dead, noUsage},
+			want:   []string{"dd", "idle", "nu"},
+		},
+		{
+			name:   "unknown active just sorts everything",
+			active: "gone",
+			rows:   []usageRow{slRow("b", 0, 0, 0.5), slRow("a", 0, 0, 0.2)},
+			want:   []string{"a", "b"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			before := make([]string, len(c.rows))
+			for i, r := range c.rows {
+				before[i] = r.Name
+			}
+			got := make([]string, 0, len(c.rows))
+			for _, r := range statuslineOrder(c.rows, c.active) {
+				got = append(got, r.Name)
+			}
+			if strings.Join(got, ",") != strings.Join(c.want, ",") {
+				t.Errorf("order=%v want %v", got, c.want)
+			}
+			for i, r := range c.rows {
+				if r.Name != before[i] {
+					t.Fatalf("input slice mutated: %v want %v", c.rows, before)
+				}
+			}
+		})
+	}
+}
+
+func TestStatuslineCollapseAndCountdown(t *testing.T) {
+	nowMs := time.Now().UnixMilli()
+	at := func(sec int64) int64 { return nowMs + sec*1000 }
+	cases := []struct {
+		name    string
+		usage   *anthropic.Usage
+		present []string
+		absent  []string
+	}{
+		{
+			name: "nothing maxed: every segment plus the 7d countdown",
+			usage: &anthropic.Usage{
+				FiveHour:     &anthropic.Bucket{Utilization: 0.10, ResetsAt: at(3600)},
+				SevenDay:     &anthropic.Bucket{Utilization: 0.40, ResetsAt: at(3*86400 + 2*3600)},
+				ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 0.20, ResetsAt: at(5 * 86400)}},
+			},
+			present: []string{"5h:", "10%", "7d:", "40%", "F:", "20%", "↻3d2h"},
+		},
+		{
+			name: "0.996 displays as 100% so it collapses, and drives the countdown",
+			usage: &anthropic.Usage{
+				FiveHour:     &anthropic.Bucket{Utilization: 0.996, ResetsAt: at(45 * 60)},
+				SevenDay:     &anthropic.Bucket{Utilization: 0.40, ResetsAt: at(10 * 60)}, // sooner but dropped
+				ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 0.20}},
+			},
+			present: []string{"5h:", "100%", "↻45m"},
+			absent:  []string{"7d:", "40%", "F:", "20%", "↻10m"},
+		},
+		{
+			name: "several maxed windows are all kept, in order, earliest reset wins",
+			usage: &anthropic.Usage{
+				FiveHour:     &anthropic.Bucket{Utilization: 1.00, ResetsAt: at(2 * 3600)},
+				SevenDay:     &anthropic.Bucket{Utilization: 0.50, ResetsAt: at(60)},
+				ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 1.37, ResetsAt: at(30 * 60)}},
+			},
+			present: []string{"5h:", "100%", "F:", "137%", "↻30m"},
+			absent:  []string{"7d:", "50%"},
+		},
+		{
+			name: "collapsed with no future reset among the kept windows: no countdown",
+			usage: &anthropic.Usage{
+				FiveHour: &anthropic.Bucket{Utilization: 1.00, ResetsAt: nowMs - 1000},
+				SevenDay: &anthropic.Bucket{Utilization: 0.50, ResetsAt: at(3 * 86400)},
+			},
+			present: []string{"5h:", "100%"},
+			absent:  []string{"7d:", "50%", "↻"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cache := statusCache{FetchedAt: nowMs, Credentials: []usageRow{{Name: "x", Usage: c.usage}}}
+			line := renderStatuslineAll("x", cache, nowMs)
+			for _, s := range c.present {
+				if !strings.Contains(line, s) {
+					t.Errorf("missing %q:\n%q", s, line)
+				}
+			}
+			for _, s := range c.absent {
+				if strings.Contains(line, s) {
+					t.Errorf("unexpected %q:\n%q", s, line)
+				}
+			}
+		})
+	}
+
+	// Kept segments preserve their relative order (5h before the weekly one).
+	segs, collapsed := statuslineCollapse(statuslineSegments(&anthropic.Usage{
+		FiveHour:     &anthropic.Bucket{Utilization: 1.0},
+		SevenDay:     &anthropic.Bucket{Utilization: 0.5},
+		ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 1.2}},
+	}))
+	if !collapsed || len(segs) != 2 {
+		t.Fatalf("collapsed=%v segs=%d want true/2", collapsed, len(segs))
+	}
+	if !strings.Contains(segs[0].text, "5h:") || !strings.Contains(segs[1].text, "F:") {
+		t.Errorf("kept segments out of order: %q %q", segs[0].text, segs[1].text)
 	}
 }
 

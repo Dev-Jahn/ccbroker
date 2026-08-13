@@ -1,0 +1,56 @@
+#!/bin/sh
+# ccb shim — runs the managed ccb binary at ~/.config/ccbroker/bin/ccb.
+#
+# A plugin's bin/ is added to PATH for Bash tool calls only (not for hooks, the
+# statusline or MCP servers), so this shim is a convenience for `ccb ...` in a
+# Bash tool call on a machine where ccb is not on the system PATH. Nothing
+# long-lived depends on it: the watch daemon and the statusline use the managed
+# path directly.
+set -u
+
+managed="${HOME:-}/.config/ccbroker/bin/ccb"
+
+missing() {
+	echo "ccb: no managed binary at $managed" >&2
+	echo "  Install it by starting a new Claude Code session (the ccbroker plugin's" >&2
+	echo "  SessionStart hook runs scripts/ensure-ccb.sh), or:" >&2
+	echo "  curl -fsSL https://raw.githubusercontent.com/Dev-Jahn/ccbroker/main/install.sh | sh" >&2
+	exit 1
+}
+
+[ -x "$managed" ] || missing
+
+# resolve prints the symlink-resolved absolute path of $1, empty if it vanishes.
+resolve() {
+	p=$1
+	n=0
+	while [ -L "$p" ] && [ "$n" -lt 20 ]; do
+		d=$(dirname -- "$p")
+		t=$(readlink -- "$p")
+		case "$t" in
+		/*) p=$t ;;
+		*) p="$d/$t" ;;
+		esac
+		n=$((n + 1))
+	done
+	[ -e "$p" ] || return 1
+	d=$(cd -P -- "$(dirname -- "$p")" 2>/dev/null && pwd) || return 1
+	printf '%s/%s\n' "$d" "$(basename -- "$p")"
+}
+
+# Recursion guard: if the managed path is this shim (copied or symlinked there),
+# exec'ing it would loop forever.
+self=$0
+case "$self" in
+*/*) ;;
+*) self=$(command -v -- "$self" 2>/dev/null) || self=$0 ;;
+esac
+target=$(resolve "$managed") || missing
+me=$(resolve "$self") || me=""
+if [ -n "$me" ] && [ "$me" = "$target" ]; then
+	echo "ccb: $managed resolves to this shim ($me) — there is no real binary to run." >&2
+	echo "  Reinstall it: curl -fsSL https://raw.githubusercontent.com/Dev-Jahn/ccbroker/main/install.sh | sh" >&2
+	exit 1
+fi
+
+exec "$managed" "$@"

@@ -1,7 +1,7 @@
 {
   "name": "ccbroker",
-  "version": "0.4.3",
-  "description": "Claude account switching, quota status and rotation policy via ccbroker (requires the `ccb` binary on PATH)",
+  "version": "0.5.0",
+  "description": "Claude account switching, quota status and rotation policy via ccbroker (ships and updates the matching `ccb` binary)",
   "repository": "https://github.com/Dev-Jahn/ccbroker",
   "license": "MIT",
   "keywords": ["credentials", "accounts", "quota"]

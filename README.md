@@ -71,8 +71,17 @@ ccb setup
 ```
 
 `install.sh` downloads the release binary for your OS/arch, verifies it against
-`checksums.txt`, and installs it to `~/.local/bin` (override with
-`CCB_INSTALL_DIR`); `ccb setup` then walks you through the client config.
+`checksums.txt`, and installs it as **one real file at
+`~/.config/ccbroker/bin/ccb`** — then symlinks `~/.local/bin/ccb` (override the
+symlink's directory with `CCB_INSTALL_DIR`; `/usr/local/bin` when run as root) at
+it. An older install that left a real binary in that directory is replaced by the
+symlink. `ccb setup` then walks you through the client config.
+
+That indirection is the whole update story: the launchd/systemd unit `ccb setup`
+writes, the statusline command and your PATH all name paths that resolve to that
+one file, so an update only ever has to replace it — no unit file, no PATH entry
+and no per-machine step. The Claude Code plugin below does exactly that
+automatically.
 
 **Broker** (`ccbrokerd`) — Linux with systemd, run as root:
 
@@ -86,8 +95,9 @@ the systemd service, and prints the tokens once.
 
 **Manual.** Grab a prebuilt binary for your platform from the
 [releases page](https://github.com/Dev-Jahn/ccbroker/releases) (assets are named
-`ccb_<os>_<arch>` / `ccbrokerd_linux_<arch>`, with a `checksums.txt`), or build
-the client with Go:
+`ccb_<os>_<arch>` / `ccbrokerd_linux_<arch>`, with a `checksums.txt`) and put it
+at `~/.config/ccbroker/bin/ccb` with a symlink to it from a PATH directory, or
+build the client with Go:
 
 ```sh
 go install github.com/Dev-Jahn/ccbroker/cmd/ccb@latest
@@ -279,11 +289,11 @@ ccb statusline --install --settings ~/.claude-work/settings.json
 
 `claude-plugin/` is a minimal Claude Code plugin exposing `/ccb-status`,
 `/ccb-use <name>`, `/ccb-auto`, `/ccb-policy [manual|account|all]` and
-`/ccbroker:statusline [on|off]` as slash commands plus a SessionStart hook that
-runs `ccb sync` (fresh token + fresh quota cache at session start). It requires
-`ccb` on PATH. Claude Code does not render statuslines from a plugin, so
-`/ccbroker:statusline` just shells out to `ccb statusline on|off` to wire the
-line into your `settings.json`.
+`/ccbroker:statusline [on|off]` as slash commands, plus two SessionStart hooks:
+`scripts/ensure-ccb.sh` (keeps the binary at the plugin's version, below) and
+`ccb sync` (fresh token + fresh quota cache at session start). Claude Code does
+not render statuslines from a plugin, so `/ccbroker:statusline` just shells out
+to `ccb statusline on|off` to wire the line into your `settings.json`.
 
 Install it from the marketplace:
 
@@ -291,6 +301,36 @@ Install it from the marketplace:
 /plugin marketplace add Dev-Jahn/jahns-cc-marketplace
 /plugin install ccbroker
 ```
+
+### The plugin version is the binary version
+
+The version in `claude-plugin/.claude-plugin/plugin.json` names both the plugin
+and the ccbroker release whose `ccb` belongs with it, so updating the plugin
+updates the binary — on every machine, without touching any of them.
+
+At every session start `scripts/ensure-ccb.sh` compares that version with what
+`~/.config/ccbroker/bin/ccb version` reports. Equal (the normal case) and it
+exits immediately — no network, no output. Different and it downloads
+`ccb_<os>_<arch>` for the matching release tag, verifies it against the release's
+`checksums.txt`, swaps it into `~/.config/ccbroker/bin/ccb` with an atomic
+rename, and restarts the watch daemon (launchd `com.ccbroker.watch`,
+systemd-user `ccb-watch`, or kill + `ccb ensure-alive` on a cron/manual host) so
+it runs the new code instead of the replaced inode. Every action is appended to
+`~/.config/ccbroker/selfupdate.log`.
+
+It never fails a session: a download failure prints one warning line and exits 0,
+leaving the working binary alone; a checksum mismatch refuses the install. If the
+`ccb` on your PATH turns out to be a *separate* binary rather than a symlink to
+the managed one, it says so and prints the `ln -sf` that converges it — that copy
+would otherwise stay behind forever.
+
+The plugin also ships `bin/ccb`, a shim that execs the managed binary. Claude
+Code puts a plugin's `bin/` on PATH for Bash tool calls only (not for hooks, the
+statusline or MCP servers), so it is a convenience for `ccb …` in a Bash tool
+call on a machine where `ccb` is not on the system PATH — never the mechanism the
+daemon or the statusline depends on. Nothing long-lived may point into the
+plugin directory: its path carries the plugin version and is swept a couple of
+weeks after each update.
 
 ### Or alongside CCS (profile switching)
 
@@ -347,8 +387,9 @@ Keep the admin API off the proxy — it stays localhost-only on the broker host.
 * **Canonical sources.** The only official sources for `ccbroker` binaries are
   this repository and its
   [GitHub Releases](https://github.com/Dev-Jahn/ccbroker/releases) (which
-  `install.sh` / `install-server.sh` verify against `checksums.txt`). Do not run
-  binaries for this tool from anywhere else.
+  `install.sh` / `install-server.sh` and the plugin's `ensure-ccb.sh` updater all
+  verify against `checksums.txt` before installing anything). Do not run binaries
+  for this tool from anywhere else.
 
 ## API
 

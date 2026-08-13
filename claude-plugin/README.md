@@ -18,20 +18,45 @@ work.
 - `/ccbroker:statusline [on|off]` — render the multi-account usage line, and
   turn it on or off in your Claude Code statusline.
 
-## SessionStart hook
+## SessionStart hooks
 
-The plugin registers a `SessionStart` hook that runs `ccb sync`, so every new
-Claude Code session starts with a freshly refreshed token and an up-to-date quota
-cache. `ccb sync` also offers any local `/login` credential to the broker (the
-account on-ramp) before writing back the active account's token.
+- `scripts/ensure-ccb.sh` — keeps the `ccb` binary at **this plugin's version**
+  (see below).
+- `ccb sync` — so every new Claude Code session starts with a freshly refreshed
+  token and an up-to-date quota cache. It also offers any local `/login`
+  credential to the broker (the account on-ramp) before writing back the active
+  account's token.
+
+## The plugin version is the binary version
+
+This plugin's version names the ccbroker release whose `ccb` belongs with it, so
+updating the plugin updates the binary on every machine.
+
+`ensure-ccb.sh` compares that version with what `~/.config/ccbroker/bin/ccb`
+reports at each session start. Equal (the normal case): it exits immediately, no
+network, no output. Different: it downloads the matching release asset, verifies
+it against the release's `checksums.txt`, swaps it into
+`~/.config/ccbroker/bin/ccb` atomically, and restarts the watch daemon (launchd,
+systemd-user, or kill + `ccb ensure-alive`). Actions are logged to
+`~/.config/ccbroker/selfupdate.log`. A failure never blocks the session: it warns
+on stderr and exits 0, leaving the working binary in place.
+
+`~/.config/ccbroker/bin/ccb` is the one real file; whatever `ccb` is on your PATH
+should be a symlink to it (`install.sh` sets that up). If it is a separate copy
+instead, the updater prints the `ln -sf` command that converges them.
+
+`bin/ccb` in this plugin is a shim that execs the managed binary. A plugin's
+`bin/` is on PATH for Bash tool calls only — not for hooks, the statusline or MCP
+servers — so it is a convenience there, never what the daemon relies on.
 
 ## Requirements
 
-Requires the `ccb` binary on your `PATH` and a configured `agent.json`. Install
-the client and run the first-run wizard from the
-[ccbroker install instructions](https://github.com/Dev-Jahn/ccbroker#install):
+A configured `agent.json` (`ccb setup`), and a broker to talk to. First-run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Dev-Jahn/ccbroker/main/install.sh | sh
 ccb setup
 ```
+
+See the
+[ccbroker install instructions](https://github.com/Dev-Jahn/ccbroker#install).

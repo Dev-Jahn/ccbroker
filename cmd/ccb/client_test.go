@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -300,12 +301,12 @@ func TestWriteIfUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	credPath := filepath.Join(dir, "creds.json")
 	target := config.Target{Type: "file", Path: credPath}
-	brokerBody, _ := json.Marshal(credFile{ClaudeAiOauth: map[string]any{"accessToken": "broker-acc"}})
+	brokerOAuth := map[string]any{"accessToken": "broker-acc"}
 
 	// Snapshot matches current → writes.
 	snapshot := map[string]any{"accessToken": "old-acc"}
 	writeCredFile(t, credPath, snapshot)
-	if wrote, err := writeIfUnchanged(target, snapshot, brokerBody); err != nil || !wrote {
+	if wrote, err := writeIfUnchanged(target, snapshot, brokerOAuth); err != nil || !wrote {
 		t.Fatalf("unchanged target should write: wrote=%v err=%v", wrote, err)
 	}
 	if got := readCredFile(t, credPath); got["accessToken"] != "broker-acc" {
@@ -315,11 +316,123 @@ func TestWriteIfUnchanged(t *testing.T) {
 	// A concurrent /login drops a fresh RT after the snapshot → abort the write.
 	snapshot = map[string]any{"accessToken": "a"} // gate saw no RT
 	writeCredFile(t, credPath, map[string]any{"accessToken": "a", "refreshToken": "fresh-login-rt"})
-	if wrote, err := writeIfUnchanged(target, snapshot, brokerBody); err != nil || wrote {
+	if wrote, err := writeIfUnchanged(target, snapshot, brokerOAuth); err != nil || wrote {
 		t.Fatalf("changed target should abort: wrote=%v err=%v", wrote, err)
 	}
 	if got := readCredFile(t, credPath); got["refreshToken"] != "fresh-login-rt" {
 		t.Errorf("aborted write clobbered the fresh /login RT: %v", got)
+	}
+}
+
+// ---- mcpOAuth clobber regression ----
+
+// TestMergeOAuthDoc: a write replaces only claudeAiOauth; every sibling key is
+// kept with its value byte-for-byte (large integers included), the old refresh
+// token is gone, and anything that is not a credentials document starts fresh.
+func TestMergeOAuthDoc(t *testing.T) {
+	// 2^53+1: not representable as float64, so a decode without UseNumber
+	// would silently alter it.
+	const mcp = `"mcpOAuth":{"srv":{"accessToken":"mcp-acc","expiresAt":9007199254740993}}`
+	const fresh = `{"claudeAiOauth":{"accessToken":"new"}}`
+	cases := []struct {
+		name string
+		cur  string
+		want string
+	}{
+		{"no document", "", fresh},
+		{"whitespace only", " \n", fresh},
+		{"replaces claudeAiOauth, keeps siblings",
+			`{"claudeAiOauth":{"accessToken":"old","refreshToken":"old-rt"},` + mcp + `,"extra":"keep"}`,
+			`{"claudeAiOauth":{"accessToken":"new"},"extra":"keep",` + mcp + `}`},
+		{"inserts claudeAiOauth beside siblings",
+			`{` + mcp + `}`,
+			`{"claudeAiOauth":{"accessToken":"new"},` + mcp + `}`},
+		{"legacy bare oauth starts fresh", `{"accessToken":"old","refreshToken":"old-rt"}`, fresh},
+		{"junk starts fresh", `not json`, fresh},
+		{"non-object starts fresh", `[1,2]`, fresh},
+		{"null starts fresh", `null`, fresh},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var cur []byte
+			if c.cur != "" {
+				cur = []byte(c.cur)
+			}
+			got, err := mergeOAuthDoc(cur, map[string]any{"accessToken": "new"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != c.want {
+				t.Errorf("merge(%s)\n got %s\nwant %s", c.cur, got, c.want)
+			}
+			if strings.Contains(string(got), "refreshToken") {
+				t.Errorf("refresh token survived the merge: %s", got)
+			}
+		})
+	}
+}
+
+// readRawDoc returns the top-level keys of a credentials document as raw JSON.
+func readRawDoc(t *testing.T, path string) map[string]json.RawMessage {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatalf("%s: %v", b, err)
+	}
+	return doc
+}
+
+// TestSyncTargetPreservesSiblingKeys is the end-to-end mcpOAuth clobber
+// regression: both a plain propagation and an adopt write leave every other
+// top-level key of the credentials document exactly as it was.
+func TestSyncTargetPreservesSiblingKeys(t *testing.T) {
+	const mcp = `{"srv":{"accessToken":"mcp-acc","expiresAt":9007199254740993}}`
+	const extra = `{"n":1,"s":"keep"}`
+	cases := []struct {
+		name  string
+		local string
+		offer offerResult
+	}{
+		{"propagation (no local RT)", `{"accessToken":"old-acc"}`, offerResult{}},
+		{"adopt (local RT offered)", `{"accessToken":"local-acc","refreshToken":"local-rt"}`,
+			offerResult{Adopted: true, Name: "personal", Gen: 5}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			credPath := filepath.Join(dir, "creds.json")
+			doc := `{"claudeAiOauth":` + c.local + `,"mcpOAuth":` + mcp + `,"extra":` + extra + `}`
+			if err := os.WriteFile(credPath, []byte(doc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			fb := newFakeBroker(t)
+			fb.offer = c.offer
+			fb.env = credEnvelope{ClaudeAiOauth: map[string]any{"accessToken": "broker-acc", "refreshToken": "broker-rt"}, Gen: 5, Account: "p@x"}
+			target := config.Target{Cred: "personal", Type: "file", Path: credPath}
+			cfg, client := fb.agent(t, target)
+
+			if fail := syncTarget(cfg, client, target, map[string]usageRow{}); fail {
+				t.Fatalf("sync reported failure")
+			}
+			got := readRawDoc(t, credPath)
+			if oauth := parseOAuthBytes(got["claudeAiOauth"]); oauth["accessToken"] != "broker-acc" || oauth["refreshToken"] != nil {
+				t.Errorf("claudeAiOauth not replaced with the stripped broker cred: %s", got["claudeAiOauth"])
+			}
+			if string(got["mcpOAuth"]) != mcp {
+				t.Errorf("mcpOAuth clobbered: got %s want %s", got["mcpOAuth"], mcp)
+			}
+			if string(got["extra"]) != extra {
+				t.Errorf("extra key clobbered: got %s want %s", got["extra"], extra)
+			}
+			if fi, err := os.Stat(credPath); err != nil || fi.Mode().Perm() != 0o600 {
+				t.Errorf("perms: %v %v", fi.Mode(), err)
+			}
+		})
 	}
 }
 

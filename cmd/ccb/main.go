@@ -412,17 +412,13 @@ func syncTarget(cfg *config.Agent, client *http.Client, t config.Target, byName 
 
 	// (e) client-side strip on ALL writes (I1): never write a refresh token to any
 	// target, regardless of broker version; write is atomic (temp+rename / single
-	// keychain update).
+	// keychain update) and merges into the target's current document so sibling
+	// keys (mcpOAuth) survive.
 	stripped := stripRefreshToken(env.ClaudeAiOauth)
-	body, err := json.Marshal(credFile{ClaudeAiOauth: stripped})
-	if err != nil {
-		logf("cred=%s ENCODE_FAIL %v", name, err)
-		return true
-	}
 	// TOCTOU guard (MAJOR-2): re-read the target immediately before writing and
 	// abort if it changed since the gate evaluated `local` — in particular if a
 	// concurrent /login dropped a fresh refresh token there. Retry next cycle.
-	switch wrote, werr := writeIfUnchanged(t, local, body); {
+	switch wrote, werr := writeIfUnchanged(t, local, stripped); {
 	case werr != nil:
 		logf("cred=%s target=%s WRITE_FAIL %v", name, t.Type, werr)
 		return true
@@ -694,10 +690,10 @@ func stripRefreshToken(m map[string]any) map[string]any {
 	return out
 }
 
-// readLocalOAuth reads the claudeAiOauth object currently at a target, or nil if
-// the target holds no credential yet.
-func readLocalOAuth(t config.Target) (map[string]any, error) {
-	var raw []byte
+// readLocalRaw reads the whole credentials document currently at a target, or
+// nil if the target holds none yet. A read FAILURE is an error, never "empty"
+// (MAJOR-1); for the keychain only "no such item" (exit 44) means empty.
+func readLocalRaw(t config.Target) ([]byte, error) {
 	switch t.Type {
 	case "file":
 		b, err := os.ReadFile(expandHome(t.Path))
@@ -707,7 +703,7 @@ func readLocalOAuth(t config.Target) (map[string]any, error) {
 			}
 			return nil, err
 		}
-		raw = b
+		return b, nil
 	case "keychain":
 		b, err := readKeychain()
 		if err != nil {
@@ -716,9 +712,18 @@ func readLocalOAuth(t config.Target) (map[string]any, error) {
 			}
 			return nil, err // a real read failure — do NOT treat as empty (MAJOR-1)
 		}
-		raw = b
+		return b, nil
 	default:
 		return nil, fmt.Errorf("unknown target type %q", t.Type)
+	}
+}
+
+// readLocalOAuth reads the claudeAiOauth object currently at a target, or nil if
+// the target holds no credential yet.
+func readLocalOAuth(t config.Target) (map[string]any, error) {
+	raw, err := readLocalRaw(t)
+	if err != nil {
+		return nil, err
 	}
 	return parseOAuthBytes(raw), nil
 }
@@ -1725,21 +1730,54 @@ func statuslineOff(settingsPath string) error {
 
 // ---- target writers ----
 
-// writeIfUnchanged re-reads the target and writes body only if the target's
+// writeIfUnchanged re-reads the target and writes oauth only if the target's
 // current oauth still matches the snapshot the overwrite gate evaluated. If it
 // changed under us — especially a refresh token appearing from a concurrent
 // /login — the write is aborted so the next cycle re-evaluates (MAJOR-2 TOCTOU
-// guard). Returns (wrote, err); a read error aborts the write (never overwrite
-// on uncertainty).
-func writeIfUnchanged(t config.Target, snapshot map[string]any, body []byte) (bool, error) {
-	cur, err := readLocalOAuth(t)
+// guard). The write merges oauth into that same re-read document, so sibling
+// keys added concurrently are kept too. Returns (wrote, err); a read error
+// aborts the write (never overwrite on uncertainty).
+func writeIfUnchanged(t config.Target, snapshot, oauth map[string]any) (bool, error) {
+	raw, err := readLocalRaw(t)
 	if err != nil {
 		return false, err
 	}
-	if !sameOAuth(cur, snapshot) {
+	if !sameOAuth(parseOAuthBytes(raw), snapshot) {
 		return false, nil
 	}
+	body, err := mergeOAuthDoc(raw, oauth)
+	if err != nil {
+		return false, err
+	}
 	return true, writeTarget(t, body)
+}
+
+// mergeOAuthDoc returns the credentials document to write: cur with only its
+// "claudeAiOauth" replaced by oauth and every other top-level key kept as-is.
+// Claude Code stores MCP-server tokens (mcpOAuth) in the same document, and
+// replacing the whole document used to wipe them on every sync (the mcpOAuth
+// clobber). A missing, empty, unparsable or non-object document, or the legacy
+// bare-oauth form (top-level accessToken), starts fresh — never fails the write.
+func mergeOAuthDoc(cur []byte, oauth map[string]any) ([]byte, error) {
+	var doc map[string]any
+	if len(bytes.TrimSpace(cur)) > 0 {
+		// UseNumber so large integers (expiresAt timestamps) round-trip exactly
+		// instead of degrading to float64.
+		dec := json.NewDecoder(bytes.NewReader(cur))
+		dec.UseNumber()
+		if err := dec.Decode(&doc); err != nil {
+			logf("target document is not a JSON object, rewriting it: %v", err)
+			doc = nil
+		}
+	}
+	if _, bare := doc["accessToken"]; bare {
+		doc = nil // legacy bare oauth object: don't carry its keys along
+	}
+	if doc == nil {
+		doc = make(map[string]any, 1)
+	}
+	doc["claudeAiOauth"] = oauth
+	return json.Marshal(doc)
 }
 
 // sameOAuth reports whether two oauth snapshots carry the same access and

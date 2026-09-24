@@ -1190,11 +1190,10 @@ func printStatuslineAll(cfg *config.Agent) {
 // renderStatuslineAll builds the full one-line status from a cache snapshot:
 // the active credential first (marked ⛁ and bright), then the rest ordered by
 // how much quota they have left (see statuslineOrder), joined by SEP, dead ones
-// prefixed ✗. Each credential shows its 5h/7d and per-model weekly segments,
-// collapsed to just the spent windows when any of them is maxed (see
-// statuslineCollapse), followed by a ↻ countdown to the reset that matters for
-// what is shown (see statuslineReset). Pure (no I/O) so it is testable; nowMs
-// drives the countdowns and the " ~stale" suffix.
+// prefixed ✗. Each credential shows every one of its 5h/7d and per-model weekly
+// segments, each carrying a ↻ countdown to its own window's reset (see
+// statuslineSegment). Pure (no I/O) so it is testable; nowMs drives the
+// countdowns and the " ~stale" suffix.
 func renderStatuslineAll(active string, cache statusCache, nowMs int64) string {
 	rows := statuslineOrder(cache.Credentials, active)
 	parts := make([]string, 0, len(rows))
@@ -1208,12 +1207,8 @@ func renderStatuslineAll(active string, cache statusCache, nowMs int64) string {
 		} else {
 			b.WriteString(slDIM + r.Name + slRST)
 		}
-		segs, collapsed := statuslineCollapse(statuslineSegments(r.Usage))
-		for _, seg := range segs {
-			b.WriteString(" " + seg.text)
-		}
-		if reset := statuslineReset(r.Usage, segs, collapsed, nowMs); reset > 0 {
-			b.WriteString(" " + slREM + "↻" + fmtRemain((reset-nowMs)/1000) + slRST)
+		for _, seg := range statuslineSegments(r.Usage, nowMs) {
+			b.WriteString(" " + seg)
 		}
 		parts = append(parts, b.String())
 	}
@@ -1282,27 +1277,19 @@ func statuslineSortKey(u *anthropic.Usage) [3]float64 {
 	return k
 }
 
-// slSeg is one rendered usage segment plus what the line needs to decide which
-// segments to keep and which reset to count down to.
-type slSeg struct {
-	text     string // rendered "<label><pct>%", colored
-	pct      int    // the displayed percentage, i.e. what the reader sees
-	resetsAt int64  // unix ms this window resets, 0 if unknown
-}
-
 // statuslineSegments renders the "5h:", "7d:" and per-model weekly segments for
 // one credential, in that order; weekly buckets are sorted by model display
 // name. A nil Usage yields no segments.
-func statuslineSegments(u *anthropic.Usage) []slSeg {
+func statuslineSegments(u *anthropic.Usage, nowMs int64) []string {
 	if u == nil {
 		return nil
 	}
-	var segs []slSeg
+	var segs []string
 	if u.FiveHour != nil {
-		segs = append(segs, statuslineSegment("5h:", *u.FiveHour))
+		segs = append(segs, statuslineSegment("5h:", *u.FiveHour, nowMs))
 	}
 	if u.SevenDay != nil {
-		segs = append(segs, statuslineSegment("7d:", *u.SevenDay))
+		segs = append(segs, statuslineSegment("7d:", *u.SevenDay, nowMs))
 	}
 	models := make([]string, 0, len(u.ScopedWeekly))
 	for m := range u.ScopedWeekly {
@@ -1310,14 +1297,16 @@ func statuslineSegments(u *anthropic.Usage) []slSeg {
 	}
 	sort.Strings(models)
 	for _, m := range models {
-		segs = append(segs, statuslineSegment(modelLabel(m), u.ScopedWeekly[m]))
+		segs = append(segs, statuslineSegment(modelLabel(m), u.ScopedWeekly[m], nowMs))
 	}
 	return segs
 }
 
-// statuslineSegment formats one "<label><pct>%" segment: label in DIM, the
-// percentage colored by utilization (>=80 HIGH, >=50 MID, else LOW).
-func statuslineSegment(label string, b anthropic.Bucket) slSeg {
+// statuslineSegment formats one "<label><pct>%↻<remain>" segment: label in DIM,
+// the percentage colored by utilization (>=80 HIGH, >=50 MID, else LOW), then
+// the countdown to this window's own reset in REM. A window whose reset is
+// unknown (0) or already past gets no countdown.
+func statuslineSegment(label string, b anthropic.Bucket, nowMs int64) string {
 	p := int(math.Round(b.Utilization * 100))
 	color := slLOW
 	switch {
@@ -1326,53 +1315,11 @@ func statuslineSegment(label string, b anthropic.Bucket) slSeg {
 	case p >= 50:
 		color = slMID
 	}
-	return slSeg{
-		text:     slDIM + label + color + fmt.Sprintf("%d%%", p) + slRST,
-		pct:      p,
-		resetsAt: b.ResetsAt,
+	seg := slDIM + label + color + fmt.Sprintf("%d%%", p) + slRST
+	if b.ResetsAt > nowMs {
+		seg += slREM + "↻" + fmtRemain((b.ResetsAt-nowMs)/1000) + slRST
 	}
-}
-
-// statuslineCollapse trims a credential's segments to what is actually blocking
-// it: once any window displays 100% or more, the others say nothing the reader
-// can act on, so only the spent ones are kept (in their original order) and the
-// second return value reports that the collapse happened. Nothing maxed out
-// means everything is shown. The test is the displayed (rounded) percentage, so
-// a window shown as "100%" always collapses the chunk, however it rounded.
-func statuslineCollapse(segs []slSeg) ([]slSeg, bool) {
-	maxed := make([]slSeg, 0, len(segs))
-	for _, s := range segs {
-		if s.pct >= 100 {
-			maxed = append(maxed, s)
-		}
-	}
-	if len(maxed) == 0 {
-		return segs, false
-	}
-	return maxed, true
-}
-
-// statuslineReset returns the unix-ms reset the ↻ countdown should track, or 0
-// for no countdown. A collapsed chunk counts down to the earliest of the spent
-// windows it kept — that is when the account becomes usable again, and showing
-// a seven-day countdown next to a maxed 5h window would badly overstate the
-// wait. An uncollapsed chunk counts down the seven-day window: it is the
-// long-cycle constraint worth tracking, whereas the fast 5h cycle is already
-// legible from how far its percentage has climbed.
-func statuslineReset(u *anthropic.Usage, segs []slSeg, collapsed bool, nowMs int64) int64 {
-	if collapsed {
-		best := int64(0)
-		for _, s := range segs {
-			if s.resetsAt > nowMs && (best == 0 || s.resetsAt < best) {
-				best = s.resetsAt
-			}
-		}
-		return best
-	}
-	if u != nil && u.SevenDay != nil && u.SevenDay.ResetsAt > nowMs {
-		return u.SevenDay.ResetsAt
-	}
-	return 0
+	return seg
 }
 
 // fmtRemain renders a seconds duration as a compact reset countdown: "XdYh"

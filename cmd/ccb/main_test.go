@@ -232,13 +232,14 @@ func TestRenderStatuslineAll(t *testing.T) {
 	if n := strings.Count(line, slSEP); n != 2 {
 		t.Errorf("separator count=%d want 2:\n%q", n, line)
 	}
-	// Reset countdown: only alpha's future SevenDay reset gets ↻; bravo's is
-	// in the past and charlie has no usage, so exactly one ↻ appears.
+	// Reset countdown: only alpha's 7d window has a future reset, so exactly one
+	// ↻ appears, glued to that segment's percentage; bravo's is in the past, the
+	// other windows have none and charlie has no usage.
 	if n := strings.Count(line, "↻"); n != 1 {
 		t.Errorf("↻ count=%d want 1:\n%q", n, line)
 	}
-	if !strings.Contains(line, slREM+"↻2h35m"+slRST) {
-		t.Errorf("alpha reset countdown ↻2h35m missing:\n%q", line)
+	if !strings.Contains(line, slMID+"71%"+slRST+slREM+"↻2h35m"+slRST) {
+		t.Errorf("alpha 7d countdown ↻2h35m not attached to its segment:\n%q", line)
 	}
 	// Stale suffix (fetched 2h ago).
 	if !strings.Contains(line, "~stale") {
@@ -355,7 +356,7 @@ func TestStatuslineOrder(t *testing.T) {
 	}
 }
 
-func TestStatuslineCollapseAndCountdown(t *testing.T) {
+func TestStatuslineSegmentsAndCountdowns(t *testing.T) {
 	nowMs := time.Now().UnixMilli()
 	at := func(sec int64) int64 { return nowMs + sec*1000 }
 	cases := []struct {
@@ -365,42 +366,35 @@ func TestStatuslineCollapseAndCountdown(t *testing.T) {
 		absent  []string
 	}{
 		{
-			name: "nothing maxed: every segment plus the 7d countdown",
+			name: "every window carries its own countdown",
 			usage: &anthropic.Usage{
-				FiveHour:     &anthropic.Bucket{Utilization: 0.10, ResetsAt: at(3600)},
-				SevenDay:     &anthropic.Bucket{Utilization: 0.40, ResetsAt: at(3*86400 + 2*3600)},
-				ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 0.20, ResetsAt: at(5 * 86400)}},
+				FiveHour:     &anthropic.Bucket{Utilization: 0.31, ResetsAt: at(1*3600 + 56*60)},
+				SevenDay:     &anthropic.Bucket{Utilization: 0.08, ResetsAt: at(5*86400 + 8*3600)},
+				ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 0.20, ResetsAt: at(2*86400 + 4*3600)}},
 			},
-			present: []string{"5h:", "10%", "7d:", "40%", "F:", "20%", "↻3d2h"},
+			present: []string{"5h:" + slLOW + "31%" + slRST + slREM + "↻1h56m" + slRST,
+				"7d:" + slLOW + "8%" + slRST + slREM + "↻5d8h" + slRST,
+				"F:" + slLOW + "20%" + slRST + slREM + "↻2d4h" + slRST},
 		},
 		{
-			name: "0.996 displays as 100% so it collapses, and drives the countdown",
+			name: "a maxed window no longer hides the others",
 			usage: &anthropic.Usage{
 				FiveHour:     &anthropic.Bucket{Utilization: 0.996, ResetsAt: at(45 * 60)},
-				SevenDay:     &anthropic.Bucket{Utilization: 0.40, ResetsAt: at(10 * 60)}, // sooner but dropped
-				ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 0.20}},
-			},
-			present: []string{"5h:", "100%", "↻45m"},
-			absent:  []string{"7d:", "40%", "F:", "20%", "↻10m"},
-		},
-		{
-			name: "several maxed windows are all kept, in order, earliest reset wins",
-			usage: &anthropic.Usage{
-				FiveHour:     &anthropic.Bucket{Utilization: 1.00, ResetsAt: at(2 * 3600)},
-				SevenDay:     &anthropic.Bucket{Utilization: 0.50, ResetsAt: at(60)},
+				SevenDay:     &anthropic.Bucket{Utilization: 0.40, ResetsAt: at(10 * 60)},
 				ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 1.37, ResetsAt: at(30 * 60)}},
 			},
-			present: []string{"5h:", "100%", "F:", "137%", "↻30m"},
-			absent:  []string{"7d:", "50%"},
+			present: []string{"5h:", "100%" + slRST + slREM + "↻45m", "7d:", "40%" + slRST + slREM + "↻10m",
+				"F:", "137%" + slRST + slREM + "↻30m"},
 		},
 		{
-			name: "collapsed with no future reset among the kept windows: no countdown",
+			name: "unknown or past resets get no countdown",
 			usage: &anthropic.Usage{
-				FiveHour: &anthropic.Bucket{Utilization: 1.00, ResetsAt: nowMs - 1000},
-				SevenDay: &anthropic.Bucket{Utilization: 0.50, ResetsAt: at(3 * 86400)},
+				FiveHour:     &anthropic.Bucket{Utilization: 1.00, ResetsAt: nowMs - 1000},
+				SevenDay:     &anthropic.Bucket{Utilization: 0.50},
+				ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 0.20, ResetsAt: nowMs}},
 			},
-			present: []string{"5h:", "100%"},
-			absent:  []string{"7d:", "50%", "↻"},
+			present: []string{"5h:", "100%", "7d:", "50%", "F:", "20%"},
+			absent:  []string{"↻"},
 		},
 	}
 	for _, c := range cases {
@@ -420,17 +414,14 @@ func TestStatuslineCollapseAndCountdown(t *testing.T) {
 		})
 	}
 
-	// Kept segments preserve their relative order (5h before the weekly one).
-	segs, collapsed := statuslineCollapse(statuslineSegments(&anthropic.Usage{
+	// Segments stay in 5h, 7d, weekly order even when one is maxed.
+	segs := statuslineSegments(&anthropic.Usage{
 		FiveHour:     &anthropic.Bucket{Utilization: 1.0},
 		SevenDay:     &anthropic.Bucket{Utilization: 0.5},
 		ScopedWeekly: map[string]anthropic.Bucket{"Fable": {Utilization: 1.2}},
-	}))
-	if !collapsed || len(segs) != 2 {
-		t.Fatalf("collapsed=%v segs=%d want true/2", collapsed, len(segs))
-	}
-	if !strings.Contains(segs[0].text, "5h:") || !strings.Contains(segs[1].text, "F:") {
-		t.Errorf("kept segments out of order: %q %q", segs[0].text, segs[1].text)
+	}, nowMs)
+	if len(segs) != 3 || !strings.Contains(segs[0], "5h:") || !strings.Contains(segs[1], "7d:") || !strings.Contains(segs[2], "F:") {
+		t.Errorf("segments missing or out of order: %q", segs)
 	}
 }
 

@@ -250,17 +250,15 @@ personal 5h:16% 7d:62%
 ```
 
 `ccb statusline --all` renders **every** account your token can read on one
-line — 5h / 7d and each per-model weekly bucket, a dim `↻` countdown to the
-next reset, each utilization colored by how full it is and the whole line
+line — 5h / 7d and each per-model weekly bucket, each followed by a dim `↻`
+countdown to its own reset, each utilization colored by how full it is and the whole line
 suffixed ` ~stale` when the cache is old. The active account comes first,
 marked `⛁`; the rest follow with the most quota left first (so the best account
 to switch to sits next to it), and dead ones (marked `✗`) or accounts with no
-usage data sort last. An account whose window is spent collapses to just the
-windows that are blocking it, counting down to the earliest of those (shown
-here without ANSI color):
+usage data sort last (shown here without ANSI color):
 
 ```
-⛁ work 5h:3% 7d:22% F:9% ↻6d18h │ personal 5h:12% 7d:40% F:71% ↻2d3h │ spare F:100% ↻1d4h
+⛁ work 5h:3%↻4h10m 7d:22%↻6d18h F:9%↻6d18h │ personal 5h:12%↻1h5m 7d:40%↻2d3h F:71%↻2d3h │ spare 5h:0% 7d:64%↻1d4h F:100%↻1d4h
 ```
 
 Turn that full line on or off as your Claude Code statusline. Both are

@@ -7,11 +7,6 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/ensure-ccb.sh\"",
             "timeout": 60
-          },
-          {
-            "type": "command",
-            "command": "ccb sync",
-            "timeout": 15
           }
         ]
       }

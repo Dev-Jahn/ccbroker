@@ -287,11 +287,12 @@ ccb statusline --install --settings ~/.claude-work/settings.json
 
 `claude-plugin/` is a minimal Claude Code plugin exposing `/ccb-status`,
 `/ccb-use <name>`, `/ccb-auto`, `/ccb-policy [manual|account|all]` and
-`/ccbroker:statusline [on|off]` as slash commands, plus two SessionStart hooks:
-`scripts/ensure-ccb.sh` (keeps the binary at the plugin's version, below) and
-`ccb sync` (fresh token + fresh quota cache at session start). Claude Code does
-not render statuslines from a plugin, so `/ccbroker:statusline` just shells out
-to `ccb statusline on|off` to wire the line into your `settings.json`.
+`/ccbroker:statusline [on|off]` as slash commands, plus one SessionStart hook:
+`scripts/ensure-ccb.sh` (keeps the binary at the plugin's version, below). The
+plugin does not sync credentials — the watch daemon and its watchdog do, session
+or no session. Claude Code does not render statuslines from a plugin, so
+`/ccbroker:statusline` just shells out to `ccb statusline on|off` to wire the
+line into your `settings.json`.
 
 Install it from the marketplace:
 
@@ -427,8 +428,8 @@ broker the **single writer** of the refresh chain.
   machine that just ran `/login`: it holds the new lineage's refresh token until
   `ccb sync` **offers** it upstream — and that token is never destroyed locally
   until the broker provably holds a live, same-account credential.
-* **Account-routed offer/adopt.** `ccb sync` (and `ccb use`, and the SessionStart
-  hook) offer any local `/login` credential to `POST /v1/creds/offer`. The broker
+* **Account-routed offer/adopt.** `ccb sync` (and `ccb use`, and every watch
+  cycle) offer any local `/login` credential to `POST /v1/creds/offer`. The broker
   verifies the token is live, routes it to the matching credential **by account**
   (not by name), checks an anti-rollback ring, and adopts it. A fresh `/login`
   therefore enters the system through the front door instead of clobbering a

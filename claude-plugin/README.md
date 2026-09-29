@@ -18,14 +18,15 @@ work.
 - `/ccbroker:statusline [on|off]` — render the multi-account usage line, and
   turn it on or off in your Claude Code statusline.
 
-## SessionStart hooks
+## SessionStart hook
 
 - `scripts/ensure-ccb.sh` — keeps the `ccb` binary at **this plugin's version**
   (see below).
-- `ccb sync` — so every new Claude Code session starts with a freshly refreshed
-  token and an up-to-date quota cache. It also offers any local `/login`
-  credential to the broker (the account on-ramp) before writing back the active
-  account's token.
+
+The plugin does not sync credentials. That is the job of the watch daemon and
+its periodic `ccb sync` watchdog, both installed by `ccb setup`: they keep the
+token and the quota cache fresh, and offer any local `/login` credential to the
+broker, whether or not a session is starting.
 
 ## The plugin version is the binary version
 
